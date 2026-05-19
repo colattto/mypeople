@@ -1,12 +1,12 @@
-# SEED: mypeople-05-tailscale
+# SEED: mypeople
 
 > seed-format: 1
 
 ## Goal
 
-Join the container to a **Tailscale** tailnet so the HUD + ttyd are reachable from the human's mac (or any other tailnet node) via a stable hostname — no docker port-publishing, no socat sidecars, no host-port juggling. Once joined, `http://<container>.tail-net.ts.net:9900/dashboard` and `http://<container>.tail-net.ts.net:7681/?arg=-t&arg=mc-main:Boss` Just Work from anywhere on the tailnet (including the user's mac, phone, or another container).
+Install the mypeople runtime in a fresh container with claude already present: a small HTTP queue (queue-server), a heartbeat/dispatch client (queue-client), a CLI (`mp`) for `spawn / send / peek / kill / status`, a per-spawn Claude Code hooks plugin so agents emit lifecycle events, a Boss role that internalizes a doctrine on spawn, a HUD + per-tab browser-attach (ttyd), and a Tailscale tailnet join so the HUD + ttyd are reachable from anywhere on the tailnet via a stable hostname.
 
-Superset of SEED 4.
+After install: `http://<container>.tail-net.ts.net:9900/dashboard` (HUD) and `http://<container>.tail-net.ts.net:7681/?arg=-t&arg=mc-main:Boss` (ttyd attach) Just Work from any tailnet node — the human's mac, phone, or another container.
 
 ## Substrate prerequisite
 
@@ -14,27 +14,29 @@ The container must be started with TUN + NET_ADMIN so tailscaled can bring up a 
 ```
 docker run --cap-add=NET_ADMIN --device /dev/net/tun:/dev/net/tun ...
 ```
-This is set in `seedlab/test-fresh/shell.sh` (the test-fresh substrate). If you spin up the container another way you MUST include those flags or the seed fails with `BLOCKED_REASON=no_tun_device`.
+If you spin up the container another way you MUST include those flags or the seed fails with `BLOCKED_REASON=no_tun_device`.
 
 ## Done
 
 Each independently verifiable from a fresh shell.
 
-All SEED 2 Done bullets remain. Plus:
+**Runtime:**
+- `curl http://127.0.0.1:9900/health` returns 200 with `{"status": "ok"}`.
+- `queue-server` and `queue-client` processes both alive in `ps`.
+- `ttyd` running with `tmux attach` so per-tab attach URLs work.
+- tailscaled running, node online on the tailnet, HUD + ttyd reachable on the tailscale IP.
 
-**Plumbing:**
-- `~/mypeople/boss-CLAUDE.md` is installed at install time (the Boss's job description, inlined in this seed).
-- `mp spawn box1/main:Boss --master --backend claude` creates the Boss tab AND sends an onboarding prompt that has the agent read `boss-CLAUDE.md`.
-- `mp spawn box1/main:worker-1 --backend claude --boss box1/main:Boss` creates a worker tab whose env has `BOSS_ID=box1/main:Boss`.
-- After any agent's Stop hook fires: status JSON file written, and (if boss_id set) `[AGENT NOTIFICATION]` line typed into the boss's pane.
+**Boss role:**
+- `~/mypeople/boss-CLAUDE.md` is installed (the Boss's job description, inlined in this seed).
+- `mp spawn <host>/main:Boss --master --backend claude` creates the Boss tab AND sends an onboarding prompt that has the agent read `boss-CLAUDE.md`.
+- After the Boss's onboarding turn, `~/mypeople/status/mc-main/Boss.json` exists with `status: "idle"` and a `summary` that mentions ≥2 doctrine keywords (`plan`, `approve`, `queue`, `mp`, `fire-and-forget`, `autonomous`).
 
-**Role behavior (the Boss actually behaves like a Boss):**
-- After the Boss's onboarding turn completes (its first Stop), `~/mypeople/status/mc-main/Boss.json` exists and its `summary` mentions ≥2 doctrine keywords (e.g. `plan`, `approve`, `queue`, `mp`, `fire-and-forget`, `autonomous`).
-- The Boss can orchestrate a worker end-to-end: sending it a "spawn a worker, give it task X, report back when done" message results in (a) a worker tab created via `mp spawn`, (b) the worker's Stop notification reaching the Boss, (c) the Boss's own next Stop summary mentioning the worker's marker.
+**Agent loop:**
+- `mp spawn <host>/main:worker-1 --backend claude --boss <host>/main:Boss` creates a worker tab whose env has `BOSS_ID=<host>/main:Boss`.
+- `mp send <host>/main:worker-1 "msg"` types the message into the worker's pane via bracketed-paste, intact.
+- When the worker's Stop hook fires: status JSON written, `[AGENT NOTIFICATION]` line typed into the Boss's pane via the queue.
 
 ## Inputs
-
-(Same as SEED 2 — no new inputs.)
 
 | name | required | default | detect | ask |
 |---|---|---|---|---|
@@ -52,11 +54,13 @@ All SEED 2 Done bullets remain. Plus:
 
 | Component | Source | Notes |
 |---|---|---|
-| `queue-server.py` | inline | unchanged from SEED 2 |
-| `queue-client.py` | inline | adds `BOSS_ID` env-injection during spawn |
-| `mp` CLI | inline | adds `--boss` flag to `spawn` verb |
-| `plugins/tmux-boss-hooks/` | inline | **extended `emit-event`**: on Stop, writes status file + POSTs send-to-boss task |
-| OS pkgs | apt: `tmux python3 jq procps` | |
+| `queue-server.py` | inline | HTTP queue: clients, agents, task submit/poll/result, dashboard |
+| `queue-client.py` | inline | heartbeat + task dispatcher; tmux input via bracketed-paste |
+| `mp` CLI | inline | `spawn / send / peek / kill / status` |
+| `plugins/tmux-boss-hooks/` | inline | Claude Code hooks plugin: SessionStart / Stop / SessionEnd → status file + boss notification |
+| `boss-CLAUDE.md` | inline | doctrine read by every Boss at spawn |
+| `dashboard.html` | inline | HUD page, served from queue-server, polls /agents + /clients |
+| OS pkgs | apt: `tmux python3 jq procps ttyd tailscale` (with ttyd binary fallback) | |
 
 ## Steps
 
@@ -193,12 +197,74 @@ EOF
 chmod 644 "$INSTALL_DIR/boss-CLAUDE.md"
 ```
 
-### 4. Write `queue-server.py` (unchanged from SEED 2)
+### 3.7. Install TPM + Dracula tmux config (CEO's preferred look)
+
+**Why**: defaults are bad (no mouse, no status bar, 0-indexed windows). When the human attaches via ttyd in the HUD, this is what they see. We install Tmux Plugin Manager + Dracula theme — same look as the CEO's host config — so the container's UX feels familiar.
+
+```bash
+# Clone TPM if missing
+[ -d "$HOME/.tmux/plugins/tpm" ] || git clone --depth 1 https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm"
+
+# Write tmux config (matches host's Dracula setup)
+cat > "$HOME/.tmux.conf" <<'EOF'
+# ── Dracula Theme ──────────────────────────────────────────
+set -g @plugin 'tmux-plugins/tpm'
+set -g @plugin 'dracula/tmux'
+
+set -g @dracula-plugins "cpu-usage ram-usage time"
+set -g @dracula-show-powerline false
+set -g @dracula-show-left-icon session
+set -g @dracula-military-time true
+set -g @dracula-day-month false
+set -g @dracula-cpu-usage-label "CPU"
+set -g @dracula-ram-usage-label "RAM"
+set -g @dracula-show-timezone false
+
+# ── General ───────────────────────────────────────────────
+set -g default-terminal "tmux-256color"
+set -ga terminal-overrides ",xterm-256color:Tc"
+set -g mouse on
+set -g base-index 1
+setw -g pane-base-index 1
+set -g renumber-windows on
+set -g history-limit 50000
+set -sg escape-time 10
+
+# ── Mouse selection ───────────────────────────────────────
+# Default MouseDown1Pane (begin-selection) is what we want — do NOT rebind
+# it to cancel/exit-copy-mode or click-drag will snap the view away.
+# unbind here to clear any prior server state.
+unbind-key -T copy-mode    MouseDown1Pane
+unbind-key -T copy-mode-vi MouseDown1Pane
+# copy-pipe goes to pbcopy on the CEO's host; inside the container pbcopy
+# doesn't exist and the pipe silently no-ops. ttyd's own browser selection
+# handles host clipboard from the user side.
+bind-key   -T copy-mode    MouseDragEnd1Pane send-keys -X copy-pipe "pbcopy"
+bind-key   -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe "pbcopy"
+
+# ── TPM (must be last) ────────────────────────────────────
+run '~/.tmux/plugins/tpm/tpm'
+EOF
+chmod 644 "$HOME/.tmux.conf"
+
+# Clone the one plugin TPM would install on first prefix-I anyway.
+# TPM's install_plugins.sh requires an already-running tmux server with
+# the conf loaded — chicken-and-egg at install time. Direct clone bypasses
+# that and makes first attach instant instead of "wait for clone".
+# Convention: a TPM plugin `<owner>/<repo>` clones to ~/.tmux/plugins/<repo>.
+[ -d "$HOME/.tmux/plugins/tmux" ] || git clone --depth 1 https://github.com/dracula/tmux "$HOME/.tmux/plugins/tmux"
+
+# If a tmux server is already running from a prior install in this
+# container, re-source the conf so the new look takes effect immediately.
+tmux source-file "$HOME/.tmux.conf" 2>/dev/null || true
+```
+
+### 4. Write `queue-server.py`
 
 ```bash
 cat > "$INSTALL_DIR/bin/queue-server.py" <<'PY_EOF'
 #!/usr/bin/env python3
-"""mypeople queue-server (SEED 3, identical to SEED 2)."""
+"""mypeople queue-server."""
 
 import http.server, json, os, sys, threading, time, uuid
 from socketserver import ThreadingMixIn
@@ -415,7 +481,7 @@ chmod +x "$INSTALL_DIR/bin/queue-server.py"
 ```bash
 cat > "$INSTALL_DIR/bin/queue-client.py" <<'PY_EOF'
 #!/usr/bin/env python3
-"""mypeople queue-client (SEED 3)."""
+"""mypeople queue-client."""
 
 import json, os, shlex, socket, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request
 
@@ -717,7 +783,7 @@ chmod +x "$INSTALL_DIR/bin/queue-client.py"
 ```bash
 cat > "$INSTALL_DIR/bin/mp" <<'PY_EOF'
 #!/usr/bin/env python3
-"""mp — mypeople CLI (SEED 3). Verbs: status, spawn, send, peek, kill."""
+"""mp — mypeople CLI. Verbs: status, spawn, send, peek, kill."""
 
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
@@ -925,7 +991,7 @@ EOF
 
 cat > "$INSTALL_DIR/plugins/tmux-boss-hooks/hooks/emit-event" <<'EOF'
 #!/bin/bash
-# Lifecycle hook for mypeople-managed Claude agents (SEED 3).
+# Lifecycle hook for mypeople-managed Claude agents.
 #
 # Triggered by Claude Code on SessionStart / Stop / SessionEnd.
 # Reads the hook payload JSON from stdin. For Stop: writes a status file
@@ -1095,6 +1161,13 @@ HOST_ID=${HOST_ID}
 INSTALL_DIR=${INSTALL_DIR:-$HOME/mypeople}
 TTYD_PORT=${TTYD_PORT:-7681}
 TS_HOSTNAME=${TS_HOSTNAME}
+# UTF-8 locale is REQUIRED. Without it the container's default POSIX
+# locale causes tmux to collapse multi-byte UTF-8 chars (every glyph
+# claude TUI uses — ●, ⏺, ✻, ⏵, ⎿, ❯, box-drawing — gets stripped to
+# ASCII `_` in tmux's internal buffer and that's what reaches the
+# browser via ttyd. NOT a font issue; the bytes themselves are lost.
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
 EOF
 chmod 600 "$HOME/.config/mypeople/queue.env"
 ```
@@ -1165,7 +1238,14 @@ echo $! > "$INSTALL_DIR/run/queue-client.pid"
 # ttyd: per-tab browser-attach. -W = writable so the browser user can type.
 # Each HUD row links to ttyd?arg=-t&arg=mc-<sess>:<tab> which becomes `tmux attach -t mc-<sess>:<tab>`.
 TTYD_PORT="${TTYD_PORT:-7681}"
-nohup ttyd -W -p "$TTYD_PORT" tmux attach > "$INSTALL_DIR/run/ttyd.log" 2>&1 &
+# xterm.js default font lacks glyphs claude uses (❯ ● ✻ etc.) — browser
+# renders them as `_` placeholders. Tell xterm.js to use a font that
+# actually has them. Menlo/Monaco are standard on macOS; on Linux the
+# browser falls back to its first available monospace match.
+nohup ttyd -W -p "$TTYD_PORT" \
+  -t 'fontFamily=Menlo, Monaco, "Cascadia Mono", "Fira Code", "Courier New", monospace' \
+  -t 'fontSize=13' \
+  tmux attach > "$INSTALL_DIR/run/ttyd.log" 2>&1 &
 echo $! > "$INSTALL_DIR/run/ttyd.pid"
 for i in $(seq 1 25); do
   curl -fsS -o /dev/null "http://127.0.0.1:${TTYD_PORT}/" && break
@@ -1199,12 +1279,12 @@ INSTALL_DIR="${INSTALL_DIR:-$HOME/mypeople}"
 export PATH="$HOME/.local/bin:$PATH"
 HOST_ID="$(grep '^HOST_ID=' "$HOME/.config/mypeople/queue.env" | cut -d= -f2-)"
 
-# --- SEED 1/2 invariants ---
+# --- core runtime invariants ---
 curl -fsS http://127.0.0.1:9900/health | grep -q '"status": *"ok"' || { echo "FAIL: /health"; exit 1; }
 ps -p "$(cat $INSTALL_DIR/run/queue-server.pid)" -o command= 2>/dev/null | grep -q queue-server.py || { echo "FAIL: server pid"; exit 1; }
 ps -p "$(cat $INSTALL_DIR/run/queue-client.pid)" -o command= 2>/dev/null | grep -q queue-client.py || { echo "FAIL: client pid"; exit 1; }
 
-# --- SEED 3 part A: transport (status file + notification routing) ---
+# --- transport: status file + notification routing ---
 BOSS_ID="$HOST_ID/main:Boss"
 WORKER_ID="$HOST_ID/main:worker-1"
 
@@ -1222,7 +1302,7 @@ for i in $(seq 1 120); do
 done
 [ -f "$BOSS_STATUS" ] || { echo "FAIL: Boss never finished onboarding (no status file)"; exit 1; }
 
-# --- SEED 3 part B: ROLE BEHAVIOR — assert Boss internalized doctrine ---
+# --- role behavior: Boss internalized doctrine ---
 # Boss's onboarding summary should mention at least 2 doctrine keywords.
 BOSS_SUMMARY=$(jq -r .summary "$BOSS_STATUS" | tr '[:upper:]' '[:lower:]')
 KEYWORD_HITS=0
@@ -1267,7 +1347,7 @@ tmux capture-pane -t mc-main:Boss -p -S -300 | grep -qE "\[AGENT NOTIFICATION\].
   exit 1
 }
 
-# --- SEED 4: HUD + ttyd ---
+# --- HUD + ttyd ---
 
 # /dashboard reachable (PUBLIC; no secret needed)
 curl -fsS http://127.0.0.1:9900/dashboard | grep -q "mypeople — HUD" || { echo "FAIL: /dashboard not serving expected HTML"; exit 1; }
@@ -1294,7 +1374,15 @@ curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${TTYD_PORT}/" | grep
 # any regression by asserting the live process command.
 ps -ax -o command | grep -E 'ttyd.* tmux attach' | grep -qv grep || { echo "FAIL: ttyd not running with 'tmux attach' — attach links would land in a default session, not the target window"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 
-# --- SEED 5: Tailscale ---
+# tmux server (started by queue-client) MUST run with UTF-8 locale.
+# Default container locale is POSIX which makes tmux strip multi-byte
+# chars (●, ⏺, ✻, ⏵, ⎿, ❯, box-drawing) to ASCII `_` inside its buffer
+# — those bytes never reach the browser. Historic bug; assert env now.
+QC_PID=$(cat "$INSTALL_DIR/run/queue-client.pid")
+QC_ENV=$(tr '\0' '\n' < /proc/$QC_PID/environ 2>/dev/null || true)
+echo "$QC_ENV" | grep -qE '^LANG=.*[Uu][Tt][Ff].?8' || { echo "FAIL: queue-client running without UTF-8 LANG — tmux will mangle unicode to underscores"; echo "$QC_ENV" | grep -E '^LANG|^LC_' || true; exit 1; }
+
+# --- Tailscale ---
 
 # tailscaled daemon alive
 sudo test -S "$INSTALL_DIR/run/tailscale-state/tailscaled.sock" || { echo "FAIL: tailscaled socket missing"; exit 1; }
@@ -1322,7 +1410,6 @@ echo "VERIFY_OK"
 
 ## Failure modes
 
-(All SEED 2 modes apply.) New:
 
 **Status file never written** → Stop hook didn't fire. Check `$INSTALL_DIR/run/hook-events.log` for any entries; if empty, the plugin didn't load — verify `--plugin-dir` was on the spawned `claude` command line and `hooks.json` parses.
 

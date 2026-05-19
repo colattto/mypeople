@@ -127,7 +127,7 @@ A short form `<session>:<tab>` is allowed in CLI invocations when the host is un
 - A failing test is a failing capability — no "agent said DONE" loophole.
 - Every SEED N declares which subset of capabilities it must satisfy; we never claim implemented without the corresponding test running green in a fresh container.
 
-## What's NOT here (intentionally, per your earlier menu)
+## What's NOT here (intentionally)
 
 - approve/deny gating
 - handoff verb
