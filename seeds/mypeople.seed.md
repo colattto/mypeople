@@ -1204,14 +1204,17 @@ done
 nohup python3 -u "$INSTALL_DIR/bin/queue-client.py" > "$INSTALL_DIR/run/queue-client.log" 2>&1 &
 echo $! > "$INSTALL_DIR/run/queue-client.pid"
 
-# ttyd: per-tab browser-attach. -W = writable so the browser user can type.
-# Each HUD row links to ttyd?arg=-t&arg=mc-<sess>:<tab> which becomes `tmux attach -t mc-<sess>:<tab>`.
+# ttyd: per-tab browser-attach.
+#   -W = writable so the browser user can type.
+#   -a = allow client to pass command args via URL (?arg=foo&arg=bar).
+#        Without -a the HUD's attach links — http://host:7681/?arg=-t&arg=mc-X:Y
+#        — are silently ignored and the user lands in a default tmux session
+#        (sometimes even a bogus session named `-t`). MANDATORY for per-tab attach.
+#   -t fontFamily/fontSize = xterm.js options (default xterm.js font lacks
+#        glyphs claude uses: ❯ ● ✻ etc.). Menlo/Monaco standard on macOS; on
+#        Linux the browser falls back to its first available monospace match.
 TTYD_PORT="${TTYD_PORT:-7681}"
-# xterm.js default font lacks glyphs claude uses (❯ ● ✻ etc.) — browser
-# renders them as `_` placeholders. Tell xterm.js to use a font that
-# actually has them. Menlo/Monaco are standard on macOS; on Linux the
-# browser falls back to its first available monospace match.
-nohup ttyd -W -p "$TTYD_PORT" \
+nohup ttyd -W -a -p "$TTYD_PORT" \
   -t 'fontFamily=Menlo, Monaco, "Cascadia Mono", "Fira Code", "Courier New", monospace' \
   -t 'fontSize=13' \
   tmux attach > "$INSTALL_DIR/run/ttyd.log" 2>&1 &
@@ -1337,11 +1340,15 @@ echo "$AGENTS_JSON" | jq -e '.[] | .tmux_target' >/dev/null || { echo "FAIL: /ag
 TTYD_PORT="$(grep ^TTYD_PORT= ~/.config/mypeople/queue.env 2>/dev/null | cut -d= -f2- || echo 7681)"
 curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${TTYD_PORT}/" | grep -q 200 || { echo "FAIL: ttyd not responding on $TTYD_PORT"; exit 1; }
 
-# ttyd must be running with the `tmux attach` command (so URL args
-# `?arg=-t&arg=mc-X:Y` form a valid `tmux attach -t mc-X:Y`). Bare `tmux`
-# silently drops the user into a default session — historic bug. Catch
-# any regression by asserting the live process command.
-ps -ax -o command | grep -E 'ttyd.* tmux attach' | grep -qv grep || { echo "FAIL: ttyd not running with 'tmux attach' — attach links would land in a default session, not the target window"; ps -ax -o command | grep ttyd | head -3; exit 1; }
+# ttyd MUST be running with both `-a` (allow URL args) and `tmux attach`.
+# Historic bugs:
+#  - bare `tmux` (no `attach`) lands user in default session
+#  - missing `-a` → URL `?arg=-t&arg=mc-X:Y` is silently ignored, also
+#    lands user in default session (sometimes creating a bogus session
+#    named "-t" from misparsed args)
+ps -ax -o command | grep -E 'ttyd.*-a.* tmux attach' | grep -qv grep || { echo "FAIL: ttyd not running with '-a ... tmux attach' — attach links would be ignored or land in a default session"; ps -ax -o command | grep ttyd | head -3; exit 1; }
+# End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
+curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
 
 # tmux server (started by queue-client) MUST run with UTF-8 locale.
 # If the host default is POSIX, tmux strips multi-byte chars (●, ⏺, ✻,
@@ -1397,6 +1404,15 @@ echo "VERIFY_OK"
 **macOS: `tailscale: command not found` but `/Applications/Tailscale.app` exists** → the Tailscale.app GUI is installed but its bundled CLI isn't symlinked into `PATH`. Two fixes:
 - (Preferred) Open Tailscale.app → preferences → enable "Install CLI". Creates `/usr/local/bin/tailscale` pointing into the app bundle. Single source of truth.
 - (Don't) `brew install tailscale`. Creates a parallel install path that competes with the app's bundled binary. If you've already started this and want to abort, `pkill -f 'brew.sh install tailscale'` and continue with the app's CLI symlink.
+
+**Clicking a HUD attach link drops me in a default tmux session (not the target window)** → ttyd was started WITHOUT `-a` / `--url-arg`. By default ttyd refuses URL-supplied command args for safety, so `?arg=-t&arg=mc-X:Y` is silently dropped. Without those args the command run becomes bare `tmux attach`, which finds whatever tmux session exists or starts a new one — never the right window. The seed's Step 9 launches `ttyd -W -a -p ...`; the `-a` is mandatory. If a LaunchAgent / systemd unit on this host pre-existed and is missing `-a`, edit its ProgramArguments to insert `-a` before `-p` and restart the service.
+
+**A bogus tmux session named `-t` shows up in `tmux list-sessions`** → side effect of the missing-`-a` bug above. When ttyd dropped the URL args but the user (or a script) then ran some `tmux ... -t ...` invocation, tmux created a session literally named `-t`. Safe cleanup (the leading dash trips up `tmux kill-session -t -t`):
+```bash
+tmux list-sessions -F '#{session_id} #{session_name}' | \
+  awk '$2 == "-t" {print $1}' | \
+  while read sid; do tmux kill-session -t "$sid"; done
+```
 
 ## Cleanup
 
