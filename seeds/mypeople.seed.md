@@ -4,17 +4,11 @@
 
 ## Goal
 
-Install the mypeople runtime in a fresh container with claude already present: a small HTTP queue (queue-server), a heartbeat/dispatch client (queue-client), a CLI (`mp`) for `spawn / send / peek / kill / status`, a per-spawn Claude Code hooks plugin so agents emit lifecycle events, a Boss role that internalizes a doctrine on spawn, a HUD + per-tab browser-attach (ttyd), and a Tailscale tailnet join so the HUD + ttyd are reachable from anywhere on the tailnet via a stable hostname.
+Install the mypeople runtime on this host with claude already installed: a small HTTP queue (queue-server), a heartbeat/dispatch client (queue-client), a CLI (`mp`) for `spawn / send / peek / kill / status`, a per-spawn Claude Code hooks plugin so agents emit lifecycle events, a Boss role that internalizes a doctrine on spawn, a HUD + per-tab browser-attach (ttyd), and a Tailscale tailnet join so the HUD + ttyd are reachable from anywhere on the tailnet via a stable hostname.
 
-After install: `http://<container>.tail-net.ts.net:9900/dashboard` (HUD) and `http://<container>.tail-net.ts.net:7681/?arg=-t&arg=mc-main:Boss` (ttyd attach) Just Work from any tailnet node — the human's mac, phone, or another container.
+After install: `http://<TS_HOSTNAME>.<tailnet>.ts.net:9900/dashboard` (HUD) and `http://<TS_HOSTNAME>.<tailnet>.ts.net:7681/?arg=-t&arg=mc-main:Boss` (ttyd attach) Just Work from any tailnet node.
 
-## Substrate prerequisite
-
-The container must be started with TUN + NET_ADMIN so tailscaled can bring up a kernel network interface:
-```
-docker run --cap-add=NET_ADMIN --device /dev/net/tun:/dev/net/tun ...
-```
-If you spin up the container another way you MUST include those flags or the seed fails with `BLOCKED_REASON=no_tun_device`.
+The seed describes **intent**; the agent reading it adapts to whatever OS / package manager / privilege model the host has. macOS, Debian, Ubuntu, RHEL — pick the right install incantation for each component named in `## Components`. If you're inside a sandboxed Linux container without TUN, that's a sandbox issue you resolve outside the seed (e.g. `--cap-add NET_ADMIN --device /dev/net/tun`).
 
 ## Done
 
@@ -47,8 +41,8 @@ Each independently verifiable from a fresh shell.
 | OS deps (`tmux python3 jq procps`) | yes | apt | `command -v` each | (no prompt — agent runs apt install non-interactively) |
 | claude CLI | yes | present | `command -v claude` | `BLOCKED_REASON=claude_not_installed` |
 | `TS_AUTHKEY` | **yes** | none | `[ -n "$TS_AUTHKEY" ]` (env or queue.env) | "Tailscale auth key — generate at https://login.tailscale.com/admin/settings/keys (reusable, ephemeral OFF, tag is fine). The seed cannot proceed without one." |
-| `TS_HOSTNAME` | no | `mypeople-$(hostname -s)` | always available | "Stable hostname this container should announce on the tailnet. Default: `mypeople-<short hostname>`. Will be reachable as `<hostname>.tail-net.ts.net`." |
-| TUN device | yes | substrate-provided | `[ -c /dev/net/tun ]` | `BLOCKED_REASON=no_tun_device` if missing (substrate must start the container with `--device /dev/net/tun --cap-add NET_ADMIN`) |
+| `TS_HOSTNAME` | no | `mypeople-$(hostname -s)` | always available | "Stable hostname to announce on the tailnet. Default: `mypeople-<short hostname>`. Reachable as `<hostname>.<tailnet>.ts.net`." |
+| TUN device (Linux only) | conditional | host-provided | `[ -c /dev/net/tun ]` on Linux | If missing on Linux: `BLOCKED_REASON=no_tun_device` — Tailscale needs a kernel TUN device. Sandboxed containers must be started with `--device /dev/net/tun --cap-add NET_ADMIN`. On macOS Tailscale uses the system extension instead; this input is N/A. |
 
 ## Components
 
@@ -70,49 +64,35 @@ Detect all inputs. Send ONE consolidated Interview message. Wait for CEO reply. 
 
 ### 1. Install OS deps
 
-```bash
-sudo apt-get update -qq
-sudo apt-get install -y tmux python3 jq procps curl iproute2 iptables ca-certificates gnupg
-# Tailscale: official Debian repo. Pin to bookworm (Debian 12) since the substrate is node:20-bookworm-slim.
-if ! command -v tailscale >/dev/null; then
-  curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-  curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-  sudo apt-get update -qq
-  sudo apt-get install -y tailscale
-fi
-command -v tailscale >/dev/null || { echo "BLOCKED_REASON=tailscale_install_failed"; exit 1; }
-# Verify the substrate exposed /dev/net/tun (required for tailscaled).
-[ -c /dev/net/tun ] || { echo "BLOCKED_REASON=no_tun_device"; exit 1; }
+**Intent**: ensure `tmux`, `python3` (>= 3.8, stdlib only — no pip deps), `jq`, `ps` (procps on Linux; built-in on macOS), `curl`, `tailscale`, and `ttyd` are all on `PATH`. Use whatever package manager the host has.
 
-# ttyd: try apt first; fall back to upstream binary if not in this Debian release.
-if ! command -v ttyd >/dev/null; then
-  if ! sudo apt-get install -y ttyd 2>/dev/null; then
-    ARCH=$(uname -m)
-    case "$ARCH" in
-      aarch64|arm64) TTYD_BIN="ttyd.aarch64" ;;
-      x86_64) TTYD_BIN="ttyd.x86_64" ;;
-      *) echo "BLOCKED_REASON=unsupported_arch_for_ttyd_$ARCH"; exit 1 ;;
-    esac
-    sudo curl -fsSL -o /usr/local/bin/ttyd \
-      "https://github.com/tsl0922/ttyd/releases/latest/download/$TTYD_BIN"
-    sudo chmod +x /usr/local/bin/ttyd
-  fi
-fi
-command -v ttyd >/dev/null || { echo "BLOCKED_REASON=ttyd_install_failed"; exit 1; }
-```
+Detect what's missing with `command -v <name>`; install only what's absent. Suggested commands per platform — the agent picks the right one for THIS host:
 
-### 2. Stop any prior daemons
+- **macOS** (Homebrew): `brew install tmux jq ttyd tailscale`. `python3` ships with the OS or via Xcode CLT; `ps` is built-in. Tailscale also offers a `.pkg` / Mac App Store install — either works.
+- **Debian / Ubuntu**: `sudo apt-get update && sudo apt-get install -y tmux python3 jq procps curl ttyd tailscale`. If `ttyd` isn't in this distro's repos, download the prebuilt binary from `https://github.com/tsl0922/ttyd/releases/latest` (architectures: `ttyd.x86_64`, `ttyd.aarch64`) and place it on `PATH`. Tailscale install per `https://tailscale.com/download/linux/` (sets up its own apt repo).
+- **RHEL/Fedora**: `sudo dnf install tmux jq procps-ng ttyd tailscale` (Tailscale repo per `https://tailscale.com/download/`).
+- **Other**: install each by name from the host's native package manager.
+
+Stop with `BLOCKED_REASON=<tool>_install_failed` if any of `tmux jq ttyd tailscale` is unreachable after install.
+
+On **Linux only**, also verify `[ -c /dev/net/tun ]`. If missing, you're in a sandboxed container without the right permissions — stop with `BLOCKED_REASON=no_tun_device` (caller fixes by re-creating the container with `--device /dev/net/tun --cap-add NET_ADMIN`). On macOS the TUN check is N/A.
+
+### 2. Stop any prior mypeople daemons (idempotent reinstall)
+
+**Intent**: previous installs may have running queue-server, queue-client, ttyd, and (Linux-no-systemd only) a user-launched `tailscaled`. Kill them so this Step's re-write of code and config is clean.
 
 ```bash
 INSTALL_DIR="${INSTALL_DIR:-$HOME/mypeople}"
 for name in queue-client queue-server ttyd tailscaled; do
   pidfile="$INSTALL_DIR/run/$name.pid"
-  [ -f "$pidfile" ] && sudo kill "$(cat $pidfile)" 2>/dev/null || true
+  [ -f "$pidfile" ] && { sudo kill "$(cat $pidfile)" 2>/dev/null || kill "$(cat $pidfile)" 2>/dev/null || true; }
 done
 pkill -f "$INSTALL_DIR/bin/queue-client.py" 2>/dev/null || true
 pkill -f "$INSTALL_DIR/bin/queue-server.py" 2>/dev/null || true
 pkill -f "ttyd -W -p" 2>/dev/null || true
-sudo pkill -f tailscaled 2>/dev/null || true
+# DO NOT kill a system-managed tailscaled (macOS Tailscale.app, Linux systemd).
+# Only kill a userland tailscaled this install previously started.
+[ -f "$INSTALL_DIR/run/tailscaled.pid" ] && sudo kill "$(cat $INSTALL_DIR/run/tailscaled.pid)" 2>/dev/null || true
 ```
 
 ### 3. Create directory layout
@@ -146,7 +126,7 @@ PY
 
 ### 3.6. Install the Boss doctrine (`boss-CLAUDE.md`)
 
-**Why**: `mp spawn --master` will send an onboarding prompt that tells the new agent to read this file. Without the doctrine on disk inside the container, a spawned "Boss" is a vanilla claude with no idea it's a Boss.
+**Why**: `mp spawn --master` will send an onboarding prompt that tells the new agent to read this file. Without the doctrine on disk, a spawned "Boss" is a vanilla claude with no idea it's a Boss.
 
 ```bash
 cat > "$INSTALL_DIR/boss-CLAUDE.md" <<'EOF'
@@ -199,7 +179,7 @@ chmod 644 "$INSTALL_DIR/boss-CLAUDE.md"
 
 ### 3.7. Install TPM + Dracula tmux config (CEO's preferred look)
 
-**Why**: defaults are bad (no mouse, no status bar, 0-indexed windows). When the human attaches via ttyd in the HUD, this is what they see. We install Tmux Plugin Manager + Dracula theme — same look as the CEO's host config — so the container's UX feels familiar.
+**Why**: tmux defaults are bad (no mouse, no status bar, 0-indexed windows). When the human attaches via ttyd in the HUD, this is what they see. Install Tmux Plugin Manager + Dracula theme so the UX is usable out of the box.
 
 ```bash
 # Clone TPM if missing
@@ -236,9 +216,8 @@ set -sg escape-time 10
 # unbind here to clear any prior server state.
 unbind-key -T copy-mode    MouseDown1Pane
 unbind-key -T copy-mode-vi MouseDown1Pane
-# copy-pipe goes to pbcopy on the CEO's host; inside the container pbcopy
-# doesn't exist and the pipe silently no-ops. ttyd's own browser selection
-# handles host clipboard from the user side.
+# copy-pipe goes to pbcopy on macOS; on Linux the pipe silently no-ops
+# (acceptable — ttyd's own browser selection handles host clipboard).
 bind-key   -T copy-mode    MouseDragEnd1Pane send-keys -X copy-pipe "pbcopy"
 bind-key   -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe "pbcopy"
 
@@ -254,8 +233,8 @@ chmod 644 "$HOME/.tmux.conf"
 # Convention: a TPM plugin `<owner>/<repo>` clones to ~/.tmux/plugins/<repo>.
 [ -d "$HOME/.tmux/plugins/tmux" ] || git clone --depth 1 https://github.com/dracula/tmux "$HOME/.tmux/plugins/tmux"
 
-# If a tmux server is already running from a prior install in this
-# container, re-source the conf so the new look takes effect immediately.
+# If a tmux server is already running from a prior install, re-source the
+# conf so the new look takes effect immediately.
 tmux source-file "$HOME/.tmux.conf" 2>/dev/null || true
 ```
 
@@ -465,10 +444,9 @@ if __name__ == "__main__":
     if not SECRET:
         print("FATAL: QUEUE_SECRET not set", file=sys.stderr)
         sys.exit(1)
-    # Bind to all interfaces inside the container's isolated network
-    # namespace so the host (and the HUD browser) can reach us at the
-    # container's bridge IP. Container's docker network is already isolated
-    # from the outside world unless ports are explicitly published.
+    # Bind to all interfaces (not just loopback) so the HUD page is
+    # reachable from outside this host (e.g. another tailnet node) via
+    # the tailscale IP after Step 8.5.
     server = ThreadingServer(("0.0.0.0", PORT), Handler)
     print(f"queue-server listening on 0.0.0.0:{PORT}", flush=True)
     server.serve_forever()
@@ -476,7 +454,7 @@ PY_EOF
 chmod +x "$INSTALL_DIR/bin/queue-server.py"
 ```
 
-### 5. Write `queue-client.py` (adds `BOSS_ID` env-injection on spawn)
+### 5. Write `queue-client.py`
 
 ```bash
 cat > "$INSTALL_DIR/bin/queue-client.py" <<'PY_EOF'
@@ -778,7 +756,7 @@ PY_EOF
 chmod +x "$INSTALL_DIR/bin/queue-client.py"
 ```
 
-### 6. Write the `mp` CLI (adds `--boss` flag to spawn)
+### 6. Write the `mp` CLI
 
 ```bash
 cat > "$INSTALL_DIR/bin/mp" <<'PY_EOF'
@@ -968,7 +946,7 @@ chmod +x "$INSTALL_DIR/bin/mp"
 ln -sf "$INSTALL_DIR/bin/mp" "$HOME/.local/bin/mp"
 ```
 
-### 7. Write the `tmux-boss-hooks` plugin (extended emit-event)
+### 7. Write the `tmux-boss-hooks` plugin
 
 ```bash
 cat > "$INSTALL_DIR/plugins/tmux-boss-hooks/.claude-plugin/plugin.json" <<'EOF'
@@ -1161,66 +1139,47 @@ HOST_ID=${HOST_ID}
 INSTALL_DIR=${INSTALL_DIR:-$HOME/mypeople}
 TTYD_PORT=${TTYD_PORT:-7681}
 TS_HOSTNAME=${TS_HOSTNAME}
-# UTF-8 locale is REQUIRED. Without it the container's default POSIX
-# locale causes tmux to collapse multi-byte UTF-8 chars (every glyph
-# claude TUI uses — ●, ⏺, ✻, ⏵, ⎿, ❯, box-drawing — gets stripped to
-# ASCII `_` in tmux's internal buffer and that's what reaches the
-# browser via ttyd. NOT a font issue; the bytes themselves are lost.
+# UTF-8 locale is REQUIRED. Hosts that default to POSIX (many Linux
+# containers, some bare-metal Linux installs) cause tmux to collapse
+# multi-byte UTF-8 chars (every glyph claude TUI uses — ●, ⏺, ✻, ⏵, ⎿,
+# ❯, box-drawing — gets stripped to ASCII `_` in tmux's internal buffer
+# and that's what reaches the browser via ttyd). macOS defaults to
+# UTF-8 already; setting these explicitly is harmless and makes the
+# behavior portable.
 LANG=C.UTF-8
 LC_ALL=C.UTF-8
 EOF
 chmod 600 "$HOME/.config/mypeople/queue.env"
 ```
 
-### 8.5. Start tailscaled + join the tailnet
+### 8.5. Bring this host onto the tailnet
 
-**Why**: each container gets its own tailnet identity. The HUD + ttyd are then reachable via `http://<TS_HOSTNAME>.<your-tailnet>.ts.net:...` from any other tailnet node (your mac, your phone, other containers) — no port-publishing, no host-IP dependency.
+**Intent**: this host gets its own tailnet identity (`$TS_HOSTNAME`) and a tailscale IP. After this Step, `http://<TS_HOSTNAME>.<tailnet>.ts.net:9900/dashboard` will be reachable from any other tailnet node.
 
-```bash
-INSTALL_DIR="${INSTALL_DIR:-$HOME/mypeople}"
-TS_HOSTNAME="${TS_HOSTNAME:-mypeople-$(hostname -s)}"
-TS_STATE_DIR="$INSTALL_DIR/run/tailscale-state"
-sudo mkdir -p "$TS_STATE_DIR"
+The mechanism varies by host:
 
-# Start tailscaled (root, needs NET_ADMIN + /dev/net/tun)
-sudo nohup tailscaled \
-  --state="$TS_STATE_DIR/tailscaled.state" \
-  --socket="$TS_STATE_DIR/tailscaled.sock" \
-  > "$INSTALL_DIR/run/tailscaled.log" 2>&1 &
-echo $! | sudo tee "$INSTALL_DIR/run/tailscaled.pid" >/dev/null
+- **macOS**: Tailscale runs as a system app (or the standalone CLI from `brew install tailscale`). If the GUI app is installed and the user is already signed in, this Step is a no-op. Otherwise, `sudo tailscale up --authkey=$TS_AUTHKEY --hostname=$TS_HOSTNAME --ssh=false --accept-routes=false`. No daemon to start manually — the app/service handles it.
 
-# Wait for the socket
-for i in $(seq 1 30); do
-  sudo test -S "$TS_STATE_DIR/tailscaled.sock" && break
-  sleep 0.5
-done
-sudo test -S "$TS_STATE_DIR/tailscaled.sock" || { echo "BLOCKED_REASON=tailscaled_socket_never_appeared"; tail -30 "$INSTALL_DIR/run/tailscaled.log"; exit 1; }
+- **Linux (systemd host)**: `tailscaled` is already managed by systemd after install. Just `sudo tailscale up --authkey=$TS_AUTHKEY --hostname=$TS_HOSTNAME --ssh=false --accept-routes=false`.
 
-# Join the tailnet
-if [ -z "${TS_AUTHKEY:-}" ]; then
-  echo "BLOCKED_REASON=ts_authkey_not_set (export TS_AUTHKEY before re-running Step 8.5)"
-  exit 1
-fi
-sudo tailscale --socket="$TS_STATE_DIR/tailscaled.sock" up \
-  --authkey="$TS_AUTHKEY" \
-  --hostname="$TS_HOSTNAME" \
-  --ssh=false \
-  --accept-routes=false \
-  --advertise-tags="" || { echo "BLOCKED_REASON=tailscale_up_failed"; exit 1; }
+- **Linux (no systemd, e.g. sandboxed container)**: start `tailscaled` manually as a userland daemon with state files under `$INSTALL_DIR/run/tailscale-state/` (it needs `/dev/net/tun` + `NET_ADMIN` — see Step 1 prereq). Then `tailscale up` with the same flags, pointing at the custom socket via `--socket=<path>`. Sample (Linux-no-systemd):
+  ```bash
+  TS_STATE_DIR="$INSTALL_DIR/run/tailscale-state"
+  sudo mkdir -p "$TS_STATE_DIR"
+  sudo nohup tailscaled \
+    --state="$TS_STATE_DIR/tailscaled.state" \
+    --socket="$TS_STATE_DIR/tailscaled.sock" \
+    > "$INSTALL_DIR/run/tailscaled.log" 2>&1 &
+  echo $! | sudo tee "$INSTALL_DIR/run/tailscaled.pid" >/dev/null
+  # wait up to 15s for socket, then:
+  sudo tailscale --socket="$TS_STATE_DIR/tailscaled.sock" up \
+    --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" \
+    --ssh=false --accept-routes=false
+  ```
 
-# Wait for the IP to assign + DNS to register
-for i in $(seq 1 30); do
-  IPV4=$(sudo tailscale --socket="$TS_STATE_DIR/tailscaled.sock" ip -4 2>/dev/null | head -1)
-  [ -n "$IPV4" ] && break
-  sleep 1
-done
-[ -n "$IPV4" ] || { echo "BLOCKED_REASON=tailscale_no_ipv4_assigned"; exit 1; }
-echo "tailscale node up: $TS_HOSTNAME @ $IPV4"
+`$TS_AUTHKEY` is required. If unset, stop with `BLOCKED_REASON=ts_authkey_not_set`.
 
-# Symlink the tailscale binary's socket so unprivileged invocations work
-sudo ln -sf "$TS_STATE_DIR/tailscaled.sock" /var/run/tailscale/tailscaled.sock 2>/dev/null || true
-sudo chmod 666 "$TS_STATE_DIR/tailscaled.sock" 2>/dev/null || true
-```
+**Verify by intent**: `tailscale status --json` reports `.Self.Online == true` and `.Self.HostName == $TS_HOSTNAME`; `tailscale ip -4` returns a `100.x.x.x` address. Stop with `BLOCKED_REASON=tailscale_no_ipv4_assigned` if not.
 
 ### 9. Start daemons
 
@@ -1375,20 +1334,26 @@ curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${TTYD_PORT}/" | grep
 ps -ax -o command | grep -E 'ttyd.* tmux attach' | grep -qv grep || { echo "FAIL: ttyd not running with 'tmux attach' — attach links would land in a default session, not the target window"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 
 # tmux server (started by queue-client) MUST run with UTF-8 locale.
-# Default container locale is POSIX which makes tmux strip multi-byte
-# chars (●, ⏺, ✻, ⏵, ⎿, ❯, box-drawing) to ASCII `_` inside its buffer
-# — those bytes never reach the browser. Historic bug; assert env now.
+# If the host default is POSIX, tmux strips multi-byte chars (●, ⏺, ✻,
+# ⏵, ⎿, ❯, box-drawing) to ASCII `_` inside its buffer — those bytes
+# never reach the browser. Historic bug; assert by inspecting the
+# running queue-client's environment.
+#   - Linux: /proc/<pid>/environ (NUL-separated)
+#   - macOS: `ps eww -p <pid>` (space-separated KEY=val on a single line)
 QC_PID=$(cat "$INSTALL_DIR/run/queue-client.pid")
-QC_ENV=$(tr '\0' '\n' < /proc/$QC_PID/environ 2>/dev/null || true)
-echo "$QC_ENV" | grep -qE '^LANG=.*[Uu][Tt][Ff].?8' || { echo "FAIL: queue-client running without UTF-8 LANG — tmux will mangle unicode to underscores"; echo "$QC_ENV" | grep -E '^LANG|^LC_' || true; exit 1; }
+if [ -r "/proc/$QC_PID/environ" ]; then
+  QC_ENV=$(tr '\0' '\n' < /proc/$QC_PID/environ)
+else
+  QC_ENV=$(ps eww -p "$QC_PID" -o command= 2>/dev/null | tr ' ' '\n')
+fi
+echo "$QC_ENV" | grep -qE '^LANG=.*[Uu][Tt][Ff].?8' || { echo "FAIL: queue-client running without UTF-8 LANG — tmux will mangle unicode to underscores"; echo "$QC_ENV" | grep -E '^LANG=|^LC_' || true; exit 1; }
 
 # --- Tailscale ---
 
-# tailscaled daemon alive
-sudo test -S "$INSTALL_DIR/run/tailscale-state/tailscaled.sock" || { echo "FAIL: tailscaled socket missing"; exit 1; }
-
-# tailscale status shows our node (json output is stable)
-TS_STATUS=$(sudo tailscale --socket="$INSTALL_DIR/run/tailscale-state/tailscaled.sock" status --json 2>&1)
+# tailscale status shows our node — works whether tailscaled runs via
+# systemd / macOS system service / userland (Step 8.5 sets up the
+# socket symlink in all three paths).
+TS_STATUS=$(tailscale status --json 2>&1)
 echo "$TS_STATUS" | jq -e '.Self.Online == true' >/dev/null || { echo "FAIL: tailscale Self.Online != true"; echo "$TS_STATUS" | head -40; exit 1; }
 echo "$TS_STATUS" | jq -e '.Self.HostName' >/dev/null || { echo "FAIL: tailscale Self.HostName missing"; exit 1; }
 TS_HOSTNAME_ACTUAL=$(echo "$TS_STATUS" | jq -r '.Self.HostName')
