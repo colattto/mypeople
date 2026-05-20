@@ -68,7 +68,11 @@ Detect all inputs. Send ONE consolidated Interview message. Wait for CEO reply. 
 
 Detect what's missing with `command -v <name>`; install only what's absent. Suggested commands per platform — the agent picks the right one for THIS host:
 
-- **macOS** (Homebrew): `brew install tmux jq ttyd tailscale`. `python3` ships with the OS or via Xcode CLT; `ps` is built-in. Tailscale also offers a `.pkg` / Mac App Store install — either works.
+- **macOS** (Homebrew): `brew install tmux jq ttyd`. `python3` ships with the OS or via Xcode CLT; `ps` is built-in.
+  - **Tailscale CLI on macOS — IMPORTANT**: if Tailscale.app is already installed (Mac App Store / direct download), the `tailscale` CLI is bundled inside the app but NOT on `PATH` by default. Don't reinstall via `brew install tailscale` — that creates a competing install path. Instead:
+    1. Open Tailscale.app → settings/preferences → enable "Install CLI" (or equivalent menu item). This creates a symlink at `/usr/local/bin/tailscale` pointing to the app's bundled binary. The user must click this manually on first install of mypeople — surface it in the Interview if `command -v tailscale` returns nothing and `/Applications/Tailscale.app` exists.
+    2. If Tailscale.app is NOT installed at all: `brew install --cask tailscale` (preferred — keeps a single source of truth) or `brew install tailscale` for CLI-only.
+  - After whichever path: verify `command -v tailscale` resolves. Do NOT proceed with two install paths fighting each other.
 - **Debian / Ubuntu**: `sudo apt-get update && sudo apt-get install -y tmux python3 jq procps curl ttyd tailscale`. If `ttyd` isn't in this distro's repos, download the prebuilt binary from `https://github.com/tsl0922/ttyd/releases/latest` (architectures: `ttyd.x86_64`, `ttyd.aarch64`) and place it on `PATH`. Tailscale install per `https://tailscale.com/download/linux/` (sets up its own apt repo).
 - **RHEL/Fedora**: `sudo dnf install tmux jq procps-ng ttyd tailscale` (Tailscale repo per `https://tailscale.com/download/`).
 - **Other**: install each by name from the host's native package manager.
@@ -1383,6 +1387,10 @@ echo "VERIFY_OK"
 **Notification never lands in Boss pane** → check that `BOSS_ID` env var was set on the worker (`tmux capture-pane -t mc-main:worker-1 -p -S -100 | grep BOSS_ID`); check queue-client log for the inbound send task targeting Boss; check queue-server log for the POST from emit-event.
 
 **Pane in copy-mode swallowed our send** → the target pane was scrolled (mouse wheel, manual entry, etc.) which puts tmux in copy/view-mode (`#{pane_in_mode}=1`). In that state `send-keys` types INTO copy-mode commands instead of the TUI's input buffer — silent failure. `tmux_send_text` auto-exits via `send-keys -X cancel` before every paste. Keep this defense. It's the single biggest reliability fix for this class of system.
+
+**macOS: `tailscale: command not found` but `/Applications/Tailscale.app` exists** → the Tailscale.app GUI is installed but its bundled CLI isn't symlinked into `PATH`. Two fixes:
+- (Preferred) Open Tailscale.app → preferences → enable "Install CLI". Creates `/usr/local/bin/tailscale` pointing into the app bundle. Single source of truth.
+- (Don't) `brew install tailscale`. Creates a parallel install path that competes with the app's bundled binary. If you've already started this and want to abort, `pkill -f 'brew.sh install tailscale'` and continue with the app's CLI symlink.
 
 ## Cleanup
 
