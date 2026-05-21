@@ -1223,10 +1223,17 @@ echo $! > "$INSTALL_DIR/run/queue-client.pid"
 #   -t fontFamily/fontSize = xterm.js options (default xterm.js font lacks
 #        glyphs claude uses: ❯ ● ✻ etc.). Menlo/Monaco standard on macOS; on
 #        Linux the browser falls back to its first available monospace match.
+#   -t disableLeaveAlert=true = kill the browser's "are you sure you want to
+#        close this page?" prompt on tab close. ttyd registers a beforeunload
+#        handler by default; this client option makes it removeEventListener
+#        the handler on connect. Safe: the underlying tmux session persists
+#        across detach — closing the tab only drops this ttyd client, no work
+#        is lost.
 TTYD_PORT="${TTYD_PORT:-7681}"
 nohup ttyd -W -a -p "$TTYD_PORT" \
   -t 'fontFamily=Menlo, Monaco, "Cascadia Mono", "Fira Code", "Courier New", monospace' \
   -t 'fontSize=13' \
+  -t 'disableLeaveAlert=true' \
   tmux attach > "$INSTALL_DIR/run/ttyd.log" 2>&1 &
 echo $! > "$INSTALL_DIR/run/ttyd.pid"
 for i in $(seq 1 25); do
@@ -1357,6 +1364,9 @@ curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${TTYD_PORT}/" | grep
 #    lands user in default session (sometimes creating a bogus session
 #    named "-t" from misparsed args)
 ps -ax -o command | grep -E 'ttyd.*-a.* tmux attach' | grep -qv grep || { echo "FAIL: ttyd not running with '-a ... tmux attach' — attach links would be ignored or land in a default session"; ps -ax -o command | grep ttyd | head -3; exit 1; }
+# ttyd MUST be running with disableLeaveAlert=true so the browser doesn't
+# fire its "are you sure you want to close this page?" prompt on tab close.
+ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert=true' | grep -qv grep || { echo "FAIL: ttyd not running with -t disableLeaveAlert=true — closing the HUD attach tab will prompt the user"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 # End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
 curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
 
