@@ -222,10 +222,22 @@ set -sg escape-time 10
 # unbind here to clear any prior server state.
 unbind-key -T copy-mode    MouseDown1Pane
 unbind-key -T copy-mode-vi MouseDown1Pane
-# copy-pipe goes to pbcopy on macOS; on Linux the pipe silently no-ops
+# copy-pipe-and-cancel (NOT copy-pipe) — without -and-cancel the pane stays
+# in copy-mode after every mouse-drag selection and silently swallows the
+# user's next keystrokes until they press Escape. On macOS pbcopy lands the
+# selection on the host clipboard; on Linux the pipe silently no-ops
 # (acceptable — ttyd's own browser selection handles host clipboard).
-bind-key   -T copy-mode    MouseDragEnd1Pane send-keys -X copy-pipe "pbcopy"
-bind-key   -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe "pbcopy"
+bind-key   -T copy-mode    MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"
+bind-key   -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"
+
+# ── Mouse-wheel scroll ────────────────────────────────────
+# Claude TUI renders on the MAIN screen (alternate_on=0) and does not
+# request mouse mode, so tmux's default WheelUpPane binding falls through
+# to `copy-mode -e` and silently traps every subsequent keystroke until
+# Escape. Kill the wheel→copy-mode path entirely. Users who want scrollback
+# can still enter copy-mode explicitly via `prefix [`.
+unbind-key -T root WheelUpPane
+unbind-key -T root WheelDownPane
 
 # ── TPM (must be last) ────────────────────────────────────
 run '~/.tmux/plugins/tpm/tpm'
