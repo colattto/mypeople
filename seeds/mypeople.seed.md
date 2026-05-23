@@ -265,7 +265,7 @@ cat > "$INSTALL_DIR/bin/queue-server.py" <<'PY_EOF'
 #!/usr/bin/env python3
 """mypeople queue-server."""
 
-import http.server, json, os, subprocess, sys, threading, time, uuid
+import http.server, json, os, sys, threading, time, uuid
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
@@ -286,75 +286,7 @@ def _host_of(agent_id):
     return ""
 
 
-def _parse_multipart(content_type, body):
-    """Parse multipart/form-data body. Returns dict of name -> (filename, bytes)."""
-    if "boundary=" not in content_type:
-        return {}
-    boundary_raw = content_type.split("boundary=", 1)[1].split(";")[0].strip().strip('"').encode()
-    boundary = boundary_raw
-    parts = {}
-    for chunk in body.split(b"--" + boundary):
-        if not chunk or chunk in (b"\r\n", b"--\r\n", b"--"):
-            continue
-        if chunk.startswith(b"\r\n"):
-            chunk = chunk[2:]
-        sep = chunk.find(b"\r\n\r\n")
-        if sep == -1:
-            continue
-        header_raw = chunk[:sep].decode("utf-8", errors="replace")
-        data = chunk[sep + 4:]
-        if data.endswith(b"\r\n"):
-            data = data[:-2]
-        name = filename = None
-        for line in header_raw.splitlines():
-            if line.lower().startswith("content-disposition:"):
-                for part in line.split(";"):
-                    part = part.strip()
-                    if part.startswith("name="):
-                        name = part[5:].strip('"')
-                    elif part.startswith("filename="):
-                        filename = part[9:].strip('"')
-        if name:
-            parts[name] = (filename, data)
-    return parts
-
-
-def _tmux_inject(target, text):
-    """Inject text into a tmux pane via bracketed paste, exiting copy-mode first.
-
-    Mirrors tmux_send_text in queue-client — kept in sync manually.
-    Called directly by the /upload handler (no queue roundtrip needed
-    since queue-server is always co-located with tmux on the same host).
-    The post-injection pane-mode check is best-effort cleanup; it does
-    not guarantee pane_in_mode == 0 on return (mirrors tmux_send_text behaviour).
-    """
-    PASTE_START = "\x1b[?2004h\x1b[200~"
-    PASTE_END   = "\x1b[201~\x1b[?2004l"
-    def _run(*args):
-        return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5)
-    r = _run("display-message", "-t", target, "-p", "#{pane_in_mode}")
-    if r.returncode == 0 and r.stdout.strip() == "1":
-        _run("send-keys", "-t", target, "-X", "cancel")
-        time.sleep(0.1)
-    safe = text.replace(PASTE_END, "").replace(PASTE_START, "")
-    payload = f"{PASTE_START}{safe}{PASTE_END}"
-    r = _run("send-keys", "-t", target, "-l", "--", payload)
-    if r.returncode != 0:
-        return False, r.stderr.strip()
-    time.sleep(0.1)
-    r = _run("send-keys", "-t", target, "Enter")
-    if r.returncode != 0:
-        return False, r.stderr.strip()
-    # Post-injection mirror: ensure pane left in text-editing mode.
-    time.sleep(0.15)
-    r = _run("display-message", "-t", target, "-p", "#{pane_in_mode}")
-    if r.returncode == 0 and r.stdout.strip() == "1":
-        _run("send-keys", "-t", target, "-X", "cancel")
-    return True, ""
-
-
 # Placeholder replacement contract (enforced in GET /attach handler):
-#   __INJECT_SECRET__    → raw SECRET value (hex token — safe as-is)
 #   __INJECT_TTYD_PORT__ → port number (digits only — safe as-is)
 #   __INJECT_TARGET__    → json.dumps(target)[1:-1] — safe in JS string literal
 #                          Tab title is set client-side: parses "host/session:tab" → "role — host | mypeople"
@@ -366,32 +298,14 @@ ATTACH_HTML_TEMPLATE = """\
 * { margin:0; padding:0; box-sizing:border-box; }
 body { width:100vw; height:100vh; overflow:hidden; background:#000; }
 iframe { width:100%; height:100%; border:none; display:block; }
-#drop-ol {
-  display:none; position:fixed; inset:0;
-  background:rgba(31,111,235,0.18); border:3px dashed #1f6feb;
-  z-index:1000; align-items:center; justify-content:center;
-  font:bold 22px system-ui; color:#1f6feb; pointer-events:none;
-}
-#drop-ol.on { display:flex; }
-#toast {
-  display:none; position:fixed; bottom:16px; right:16px;
-  padding:10px 16px; border-radius:6px; font:14px system-ui;
-  color:#fff; z-index:2000;
-}
 </style></head>
 <body>
-<div id="drop-ol">📎 Solte a imagem aqui</div>
-<div id="toast"></div>
 <iframe id="term"></iframe>
 <script>
-const SECRET  = "__INJECT_SECRET__";
-const TARGET  = "__INJECT_TARGET__";
-const TPORT   = "__INJECT_TTYD_PORT__";
-const iframe  = document.getElementById('term');
-const overlay = document.getElementById('drop-ol');
-const toast   = document.getElementById('toast');
+const TARGET = "__INJECT_TARGET__";
+const TPORT  = "__INJECT_TTYD_PORT__";
 // Friendly browser-tab title: "Boss — hecktor | mypeople"
-// TARGET format: "host/session:tab"  (canonicalized by the CLI before this page is served)
+// TARGET format: "host/session:tab"
 (function setTitle() {
   const slash = TARGET.indexOf('/');
   const host  = slash >= 0 ? TARGET.slice(0, slash) : TARGET;
@@ -401,47 +315,8 @@ const toast   = document.getElementById('toast');
   document.title = `${role} — ${host} | mypeople`;
 })();
 // Set iframe src via JS so we can use location.hostname at runtime.
-iframe.src = `http://${location.hostname}:${TPORT}/?arg=-t&arg=${encodeURIComponent(TARGET)}`;
-
-function showToast(msg, err) {
-  toast.textContent = msg;
-  toast.style.background = err ? '#a52a2a' : '#1e6e2c';
-  toast.style.display = 'block';
-  setTimeout(() => { toast.style.display = 'none'; }, 3500);
-}
-
-// Pointer-events trick: disabling pointer events on the cross-origin
-// iframe routes dragover/drop to the parent document, which can then
-// call preventDefault() to own the drop (instead of the browser
-// navigating the tab to the dropped file).
-let dragDepth = 0;
-document.addEventListener('dragenter', e => {
-  if (!(e.dataTransfer && e.dataTransfer.types.includes('Files'))) return;
-  if (++dragDepth === 1) { iframe.style.pointerEvents = 'none'; overlay.classList.add('on'); }
-});
-document.addEventListener('dragleave', e => {
-  if (!(e.dataTransfer && e.dataTransfer.types.includes('Files'))) return;
-  if (--dragDepth <= 0) { dragDepth = 0; iframe.style.pointerEvents = ''; overlay.classList.remove('on'); }
-});
-document.addEventListener('dragover', e => {
-  if (e.dataTransfer && e.dataTransfer.types.includes('Files')) {
-    e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
-  }
-});
-document.addEventListener('drop', async e => {
-  e.preventDefault();
-  dragDepth = 0; iframe.style.pointerEvents = ''; overlay.classList.remove('on');
-  const file = e.dataTransfer.files[0];
-  if (!file) return;
-  if (!file.type.startsWith('image/')) { showToast('Apenas imagens suportadas', true); return; }
-  const fd = new FormData(); fd.append('file', file); fd.append('target', TARGET);
-  try {
-    const r = await fetch('/upload', { method:'POST', headers:{'X-Queue-Secret': SECRET}, body: fd });
-    const j = await r.json();
-    if (j.ok) showToast(`📎 ${j.path.split('/').pop()} enviado`, false);
-    else showToast('Erro: ' + (j.error || '?'), true);
-  } catch(err) { showToast('Falha no upload: ' + err.message, true); }
-});
+document.getElementById('term').src =
+  `http://${location.hostname}:${TPORT}/?arg=-t&arg=${encodeURIComponent(TARGET)}`;
 </script>
 </body></html>
 """
@@ -484,7 +359,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ttyd_port = os.environ.get("TTYD_PORT", "7681")
             safe_target_js = json.dumps(target)[1:-1]   # safe in JS string literal
             html_page = (ATTACH_HTML_TEMPLATE
-                         .replace("__INJECT_SECRET__", SECRET)
                          .replace("__INJECT_TTYD_PORT__", ttyd_port)
                          .replace("__INJECT_TARGET__", safe_target_js))
             data = html_page.encode()
@@ -567,45 +441,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(401, {"error": "unauthorized"})
         u = urlparse(self.path)
         p = u.path
-
-        if p == "/upload":
-            ct = self.headers.get("Content-Type", "")
-            MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            if length > MAX_UPLOAD_BYTES:
-                return self._json(413, {"error": f"file too large (max {MAX_UPLOAD_BYTES // (1024*1024)} MB)"})
-            body = self.rfile.read(length)
-            fields = _parse_multipart(ct, body)
-            file_entry   = fields.get("file")
-            target_entry = fields.get("target")
-            if not file_entry or not target_entry:
-                return self._json(400, {"error": "file and target fields required"})
-            filename, file_bytes = file_entry
-            _, target_bytes = target_entry
-            if not file_bytes:
-                return self._json(400, {"error": "empty file"})
-            target_str = target_bytes.decode("utf-8", errors="replace").strip()
-            # Derive tmux_target from agent_id without registry lookup.
-            # agent_id format: "host/session:tab"  →  tmux target: "mc-session:tab"
-            # Fallback: treat as tmux target directly if format doesn't match.
-            if "/" in target_str and ":" in target_str:
-                after_slash = target_str.split("/", 1)[1]   # "session:tab"
-                bare_sess, _, tab = after_slash.partition(":")
-                mc_sess = bare_sess if bare_sess.startswith("mc-") else f"mc-{bare_sess}"
-                tmux_target = f"{mc_sess}:{tab}"
-            else:
-                tmux_target = target_str
-            ext = os.path.splitext(filename or "")[1] or ".png"
-            upload_dir = os.path.join(INSTALL_DIR, "uploads")
-            os.makedirs(upload_dir, exist_ok=True)
-            save_path = os.path.join(upload_dir, f"{uuid.uuid4().hex}{ext}")
-            with open(save_path, "wb") as fh:
-                fh.write(file_bytes)
-            ok, err = _tmux_inject(tmux_target, save_path)
-            if ok:
-                return self._json(200, {"ok": True, "path": save_path})
-            return self._json(500, {"ok": False, "error": err})
-
         data = self._read_json()
         if data is None:
             return self._json(400, {"error": "bad json"})
@@ -1179,51 +1014,6 @@ def cmd_kill(cfg, args):
         print(f"Kill FAILED: {t.get('error', '?')}", file=sys.stderr); sys.exit(1)
 
 
-def cmd_send_image(cfg, args):
-    """Copy a local image to ~/mypeople/uploads/ and send its path to an agent.
-
-    The path is typed into the agent's pane via tmux bracketed-paste, where
-    Claude Code reads it as an image attachment — identical to dragging a
-    file into a native terminal session.
-
-    Usage: mp send-image <agent_id> <image_path>
-    """
-    if len(args) < 2:
-        print("Usage: mp send-image <agent_id> <image_path>", file=sys.stderr)
-        sys.exit(2)
-    aid = canonicalize_agent_id(args[0], cfg["HOST_ID"])
-    # send-image uploads to the local filesystem then sends the path.
-    # This only works when the target agent runs on this same host.
-    target_host = aid.split("/", 1)[0]
-    if target_host != cfg["HOST_ID"]:
-        print(f"send-image requires target agent on this host ({cfg['HOST_ID']}); "
-              f"got {target_host}. Use the /attach browser UI to send images to remote agents.",
-              file=sys.stderr)
-        sys.exit(1)
-    src = os.path.expanduser(args[1])
-    if not os.path.isfile(src):
-        print(f"File not found: {src}", file=sys.stderr)
-        sys.exit(1)
-    import shutil, uuid as _uuid
-    install_dir = os.path.expanduser(cfg.get("INSTALL_DIR", "~/mypeople"))
-    upload_dir = os.path.join(install_dir, "uploads")
-    os.makedirs(upload_dir, exist_ok=True)
-    ext = os.path.splitext(src)[1] or ".png"
-    dst = os.path.join(upload_dir, f"{_uuid.uuid4().hex}{ext}")
-    try:
-        shutil.copy2(src, dst)
-    except OSError as e:
-        print(f"Failed to copy image: {e}", file=sys.stderr)
-        sys.exit(1)
-    body = {"action": "send", "target_agent": aid, "payload": {"message": dst}}
-    t = submit_and_wait(cfg, body, timeout=10)
-    if t["status"] == "done":
-        print(f"Image sent to {aid}: {dst}")
-    else:
-        print(f"Send FAILED: {t.get('error', '?')}", file=sys.stderr)
-        sys.exit(1)
-
-
 def cmd_upgrade_config(cfg, args):
     """Re-apply the canonical tmux config saved at install time.
 
@@ -1249,7 +1039,7 @@ def cmd_upgrade_config(cfg, args):
               "It will take effect on next tmux start.")
 
 
-COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "upgrade-config": cmd_upgrade_config, "send-image": cmd_send_image}
+COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "upgrade-config": cmd_upgrade_config}
 
 
 def main():
@@ -1673,20 +1463,13 @@ ps -ax -o command | grep -E 'ttyd.*-a.* tmux attach' | grep -qv grep || { echo "
 ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert=true' | grep -qv grep || { echo "FAIL: ttyd not running with -t disableLeaveAlert=true — closing the HUD attach tab will prompt the user"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 # End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
 curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
-# /attach wrapper page served by queue-server
+# /attach wrapper page served by queue-server (title JS + agent_id injected)
 curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'mypeople terminal' || { echo "FAIL: /attach not serving wrapper page"; exit 1; }
-curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q '__INJECT_SECRET__' && { echo "FAIL: /attach didn't inject secret"; exit 1; }
-curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'pointer-events' || { echo "FAIL: /attach missing pointer-events drag fix"; exit 1; }
-
-# /upload rejects missing secret
-curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:9900/upload" | grep -q '401' || { echo "FAIL: /upload should 401 without secret"; exit 1; }
+curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'setTitle' || { echo "FAIL: /attach missing tab-title JS"; exit 1; }
 
 # dashboard attach links point to /attach (not direct :7681)
 QUEUE_SECRET_VAL="$(grep ^QUEUE_SECRET= ~/.config/mypeople/queue.env | cut -d= -f2-)"
 curl -fsS -H "X-Queue-Secret: $QUEUE_SECRET_VAL" "http://127.0.0.1:9900/dashboard" | grep -q '/attach?target=' || { echo "FAIL: dashboard attach links still point to :7681 instead of /attach"; exit 1; }
-
-# mp send-image --help / usage
-mp send-image 2>&1 | grep -q 'Usage: mp send-image' || { echo "FAIL: mp send-image missing usage"; exit 1; }
 
 # tmux server (started by queue-client) MUST run with UTF-8 locale.
 # If the host default is POSIX, tmux strips multi-byte chars (●, ⏺, ✻,
