@@ -463,6 +463,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         p = u.path
         if p == "/health":
             return self._json(200, {"status": "ok", "uptime": int(time.time() - START_TS)})
+        # /attach is PUBLIC (no secret check) — secret is injected into HTML
+        if p == "/attach":
+            qs = parse_qs(u.query)
+            target = qs.get("target", [""])[0]
+            if not target:
+                return self._json(400, {"error": "target required"})
+            import json as _json
+            ttyd_port = os.environ.get("TTYD_PORT", "7681")
+            safe_target = _json.dumps(target)[1:-1]  # JSON-escapes without surrounding quotes
+            html_page = (ATTACH_HTML_TEMPLATE
+                         .replace("__INJECT_SECRET__", SECRET)
+                         .replace("__INJECT_TTYD_PORT__", ttyd_port)
+                         .replace("__INJECT_TARGET__", safe_target))
+            data = html_page.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         # /dashboard is PUBLIC (no secret check) — secret is injected into HTML
         # for the in-page fetch calls. Browser users don't have the secret.
         if p == "/dashboard":
@@ -1299,10 +1319,9 @@ async function getJson(path) {
 async function refresh() {
   try {
     const [a, c] = await Promise.all([getJson('/agents'), getJson('/clients')]);
-    const ttydHost = location.hostname || '127.0.0.1';
     const rows = a.map(x => {
       const target = x.tmux_target || '';
-      const url = `http://${ttydHost}:7681/?arg=-t&arg=${encodeURIComponent(target)}`;
+      const url = `/attach?target=${encodeURIComponent(target)}`;
       const safeSummary = (x.summary || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])).slice(0, 120);
       return `<tr>
         <td><code>${x.agent_id}</code></td>
