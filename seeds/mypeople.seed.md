@@ -243,6 +243,8 @@ unbind-key -T root WheelDownPane
 run '~/.tmux/plugins/tpm/tpm'
 EOF
 chmod 644 "$HOME/.tmux.conf"
+# Save canonical copy so `mp upgrade-config` can re-apply without re-running the full seed.
+cp "$HOME/.tmux.conf" "$INSTALL_DIR/tmux.conf"
 
 # Clone the one plugin TPM would install on first prefix-I anyway.
 # TPM's install_plugins.sh requires an already-running tmux server with
@@ -814,6 +816,7 @@ def load_env():
     cfg["QUEUE_URL"] = os.environ.get("QUEUE_URL", cfg.get("QUEUE_URL", "http://127.0.0.1:9900"))
     cfg["QUEUE_SECRET"] = os.environ.get("QUEUE_SECRET", cfg.get("QUEUE_SECRET", ""))
     cfg["HOST_ID"] = os.environ.get("HOST_ID", cfg.get("HOST_ID", "")) or _hostname()
+    cfg["INSTALL_DIR"] = os.environ.get("INSTALL_DIR", cfg.get("INSTALL_DIR", str(Path.home() / "mypeople")))
     return cfg
 
 
@@ -956,7 +959,32 @@ def cmd_kill(cfg, args):
         print(f"Kill FAILED: {t.get('error', '?')}", file=sys.stderr); sys.exit(1)
 
 
-COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill}
+def cmd_upgrade_config(cfg, args):
+    """Re-apply the canonical tmux config saved at install time.
+
+    Copies ~/mypeople/tmux.conf → ~/.tmux.conf and reloads the running
+    tmux server. Fixes hosts where the installed ~/.tmux.conf pre-dates
+    a seed update (e.g. missing WheelUpPane unbinds or copy-pipe-and-cancel).
+    Safe to run with live agents — only config is touched, no panes are killed.
+    """
+    import shutil, subprocess as _sp
+    install_dir = os.path.expanduser(cfg.get("INSTALL_DIR", "~/mypeople"))
+    src = os.path.join(install_dir, "tmux.conf")
+    dst = os.path.expanduser("~/.tmux.conf")
+    if not os.path.exists(src):
+        print(f"Canonical config not found at {src}.\n"
+              "Re-run the seed to regenerate it.", file=sys.stderr)
+        sys.exit(1)
+    shutil.copy2(src, dst)
+    r = _sp.run(["tmux", "source-file", dst], capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"Config updated: {src} → {dst} (tmux reloaded)")
+    else:
+        print(f"Config written to {dst} but tmux reload failed (no server running?).\n"
+              "It will take effect on next tmux start.")
+
+
+COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "upgrade-config": cmd_upgrade_config}
 
 
 def main():
