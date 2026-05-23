@@ -265,12 +265,13 @@ cat > "$INSTALL_DIR/bin/queue-server.py" <<'PY_EOF'
 #!/usr/bin/env python3
 """mypeople queue-server."""
 
-import http.server, json, os, sys, threading, time, uuid
+import http.server, json, os, subprocess, sys, threading, time, uuid
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("QUEUE_PORT", "9900"))
 SECRET = os.environ.get("QUEUE_SECRET", "")
+INSTALL_DIR = os.environ.get("INSTALL_DIR", os.path.expanduser("~/mypeople"))
 START_TS = time.time()
 
 _lock = threading.Lock()
@@ -283,6 +284,144 @@ def _host_of(agent_id):
     if "/" in agent_id and ":" in agent_id:
         return agent_id.split("/", 1)[0]
     return ""
+
+
+def _parse_multipart(content_type, body):
+    """Parse multipart/form-data body. Returns dict of name -> (filename, bytes)."""
+    if "boundary=" not in content_type:
+        return {}
+    boundary = content_type.split("boundary=", 1)[1].strip().encode()
+    parts = {}
+    for chunk in body.split(b"--" + boundary):
+        if not chunk or chunk in (b"\r\n", b"--\r\n", b"--"):
+            continue
+        if chunk.startswith(b"\r\n"):
+            chunk = chunk[2:]
+        sep = chunk.find(b"\r\n\r\n")
+        if sep == -1:
+            continue
+        header_raw = chunk[:sep].decode("utf-8", errors="replace")
+        data = chunk[sep + 4:]
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        name = filename = None
+        for line in header_raw.splitlines():
+            if line.lower().startswith("content-disposition:"):
+                for part in line.split(";"):
+                    part = part.strip()
+                    if part.startswith("name="):
+                        name = part[5:].strip('"')
+                    elif part.startswith("filename="):
+                        filename = part[9:].strip('"')
+        if name:
+            parts[name] = (filename, data)
+    return parts
+
+
+def _tmux_inject(target, text):
+    """Inject text into a tmux pane via bracketed paste, exiting copy-mode first.
+
+    Mirrors tmux_send_text in queue-client — kept in sync manually.
+    Called directly by the /upload handler (no queue roundtrip needed
+    since queue-server is always co-located with tmux on the same host).
+    """
+    PASTE_START = "\x1b[?2004h\x1b[200~"
+    PASTE_END   = "\x1b[201~\x1b[?2004l"
+    def _run(*args):
+        return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=5)
+    r = _run("display-message", "-t", target, "-p", "#{pane_in_mode}")
+    if r.returncode == 0 and r.stdout.strip() == "1":
+        _run("send-keys", "-t", target, "-X", "cancel")
+        time.sleep(0.1)
+    safe = text.replace(PASTE_END, "").replace(PASTE_START, "")
+    payload = f"{PASTE_START}{safe}{PASTE_END}"
+    r = _run("send-keys", "-t", target, "-l", "--", payload)
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+    time.sleep(0.1)
+    r = _run("send-keys", "-t", target, "Enter")
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+    return True, ""
+
+
+ATTACH_HTML_TEMPLATE = """\
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>__INJECT_TARGET__ — mypeople terminal</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { width:100vw; height:100vh; overflow:hidden; background:#000; }
+iframe { width:100%; height:100%; border:none; display:block; }
+#drop-ol {
+  display:none; position:fixed; inset:0;
+  background:rgba(31,111,235,0.18); border:3px dashed #1f6feb;
+  z-index:1000; align-items:center; justify-content:center;
+  font:bold 22px system-ui; color:#1f6feb; pointer-events:none;
+}
+#drop-ol.on { display:flex; }
+#toast {
+  display:none; position:fixed; bottom:16px; right:16px;
+  padding:10px 16px; border-radius:6px; font:14px system-ui;
+  color:#fff; z-index:2000;
+}
+</style></head>
+<body>
+<div id="drop-ol">📎 Solte a imagem aqui</div>
+<div id="toast"></div>
+<iframe id="term"></iframe>
+<script>
+const SECRET  = "__INJECT_SECRET__";
+const TARGET  = "__INJECT_TARGET__";
+const TPORT   = "__INJECT_TTYD_PORT__";
+const iframe  = document.getElementById('term');
+const overlay = document.getElementById('drop-ol');
+const toast   = document.getElementById('toast');
+// Set iframe src via JS so we can use location.hostname at runtime.
+iframe.src = `http://${location.hostname}:${TPORT}/?arg=-t&arg=${encodeURIComponent(TARGET)}`;
+
+function showToast(msg, err) {
+  toast.textContent = msg;
+  toast.style.background = err ? '#a52a2a' : '#1e6e2c';
+  toast.style.display = 'block';
+  setTimeout(() => { toast.style.display = 'none'; }, 3500);
+}
+
+// Pointer-events trick: disabling pointer events on the cross-origin
+// iframe routes dragover/drop to the parent document, which can then
+// call preventDefault() to own the drop (instead of the browser
+// navigating the tab to the dropped file).
+let dragDepth = 0;
+document.addEventListener('dragenter', e => {
+  if (!(e.dataTransfer && e.dataTransfer.types.includes('Files'))) return;
+  if (++dragDepth === 1) { iframe.style.pointerEvents = 'none'; overlay.classList.add('on'); }
+});
+document.addEventListener('dragleave', e => {
+  if (!(e.dataTransfer && e.dataTransfer.types.includes('Files'))) return;
+  if (--dragDepth <= 0) { dragDepth = 0; iframe.style.pointerEvents = ''; overlay.classList.remove('on'); }
+});
+document.addEventListener('dragover', e => {
+  if (e.dataTransfer && e.dataTransfer.types.includes('Files')) {
+    e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
+  }
+});
+document.addEventListener('drop', async e => {
+  e.preventDefault();
+  dragDepth = 0; iframe.style.pointerEvents = ''; overlay.classList.remove('on');
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  if (!file.type.startsWith('image/')) { showToast('Apenas imagens suportadas', true); return; }
+  const fd = new FormData(); fd.append('file', file); fd.append('target', TARGET);
+  try {
+    const r = await fetch('/upload', { method:'POST', headers:{'X-Queue-Secret': SECRET}, body: fd });
+    const j = await r.json();
+    if (j.ok) showToast(`📎 ${j.path.split('/').pop()} enviado`, false);
+    else showToast('Erro: ' + (j.error || '?'), true);
+  } catch(err) { showToast('Falha no upload: ' + err.message, true); }
+});
+</script>
+</body></html>
+"""
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
