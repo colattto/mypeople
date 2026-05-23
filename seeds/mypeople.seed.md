@@ -290,7 +290,8 @@ def _parse_multipart(content_type, body):
     """Parse multipart/form-data body. Returns dict of name -> (filename, bytes)."""
     if "boundary=" not in content_type:
         return {}
-    boundary = content_type.split("boundary=", 1)[1].strip().encode()
+    boundary_raw = content_type.split("boundary=", 1)[1].split(";")[0].strip().strip('"').encode()
+    boundary = boundary_raw
     parts = {}
     for chunk in body.split(b"--" + boundary):
         if not chunk or chunk in (b"\r\n", b"--\r\n", b"--"):
@@ -342,9 +343,19 @@ def _tmux_inject(target, text):
     r = _run("send-keys", "-t", target, "Enter")
     if r.returncode != 0:
         return False, r.stderr.strip()
+    # Post-injection mirror: ensure pane left in text-editing mode.
+    time.sleep(0.15)
+    r = _run("display-message", "-t", target, "-p", "#{pane_in_mode}")
+    if r.returncode == 0 and r.stdout.strip() == "1":
+        _run("send-keys", "-t", target, "-X", "cancel")
     return True, ""
 
 
+# Placeholder replacement contract (enforced in GET /attach handler):
+#   __INJECT_SECRET__    → raw SECRET value (hex token — no escaping needed)
+#   __INJECT_TTYD_PORT__ → port number (digits only — no escaping needed)
+#   __INJECT_TARGET__    → json.dumps(target) for JS literal; html.escape(target) for <title>
+#   NOTE: do NOT use raw .replace() for __INJECT_TARGET__ — use the helpers below.
 ATTACH_HTML_TEMPLATE = """\
 <!doctype html>
 <html><head><meta charset="utf-8">
@@ -1549,7 +1560,7 @@ ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert=true' | grep -qv grep || { 
 # End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
 curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
 # /attach wrapper page served by queue-server
-curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'mypeople — terminal' || { echo "FAIL: /attach not serving wrapper page"; exit 1; }
+curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'mypeople terminal' || { echo "FAIL: /attach not serving wrapper page"; exit 1; }
 curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q '__INJECT_SECRET__' && { echo "FAIL: /attach didn't inject secret"; exit 1; }
 curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'pointer-events' || { echo "FAIL: /attach missing pointer-events drag fix"; exit 1; }
 
