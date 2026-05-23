@@ -283,6 +283,41 @@ def _host_of(agent_id):
     return ""
 
 
+# Placeholder replacement contract (enforced in GET /attach handler):
+#   __INJECT_TTYD_PORT__ → port number (digits only — safe as-is)
+#   __INJECT_TARGET__    → json.dumps(target)[1:-1] — safe in JS string literal
+#                          Tab title is set client-side: parses "host/session:tab" → "role — host | mypeople"
+ATTACH_HTML_TEMPLATE = """\
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>mypeople terminal</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { width:100vw; height:100vh; overflow:hidden; background:#000; }
+iframe { width:100%; height:100%; border:none; display:block; }
+</style></head>
+<body>
+<iframe id="term"></iframe>
+<script>
+const TARGET = "__INJECT_TARGET__";
+const TPORT  = "__INJECT_TTYD_PORT__";
+// Friendly browser-tab title: "Boss — hecktor | mypeople"
+// TARGET format: "host/session:tab"
+(function setTitle() {
+  const slash = TARGET.indexOf('/');
+  const host  = slash >= 0 ? TARGET.slice(0, slash) : TARGET;
+  const after = slash >= 0 ? TARGET.slice(slash + 1) : TARGET;
+  const colon = after.indexOf(':');
+  const role  = colon >= 0 ? after.slice(colon + 1) : after;
+  document.title = `${role} — ${host} | mypeople`;
+})();
+document.getElementById('term').src =
+  `http://${location.hostname}:${TPORT}/?arg=-t&arg=${encodeURIComponent(TARGET)}`;
+</script>
+</body></html>
+"""
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, status, body):
         data = json.dumps(body).encode()
@@ -311,6 +346,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         p = u.path
         if p == "/health":
             return self._json(200, {"status": "ok", "uptime": int(time.time() - START_TS)})
+        # /attach is PUBLIC — serves a thin wrapper that sets a friendly browser-tab title
+        # and embeds the ttyd iframe. The target agent_id is injected into JS.
+        if p == "/attach":
+            qs = parse_qs(u.query)
+            target = qs.get("target", [""])[0]
+            if not target:
+                return self._json(400, {"error": "target required"})
+            ttyd_port = os.environ.get("TTYD_PORT", "7681")
+            safe_target_js = json.dumps(target)[1:-1]   # safe in JS string literal
+            html_page = (ATTACH_HTML_TEMPLATE
+                         .replace("__INJECT_TTYD_PORT__", ttyd_port)
+                         .replace("__INJECT_TARGET__", safe_target_js))
+            data = html_page.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         # /dashboard is PUBLIC (no secret check) — secret is injected into HTML
         # for the in-page fetch calls. Browser users don't have the secret.
         if p == "/dashboard":
@@ -1121,10 +1175,8 @@ async function getJson(path) {
 async function refresh() {
   try {
     const [a, c] = await Promise.all([getJson('/agents'), getJson('/clients')]);
-    const ttydHost = location.hostname || '127.0.0.1';
     const rows = a.map(x => {
-      const target = x.tmux_target || '';
-      const url = `http://${ttydHost}:7681/?arg=-t&arg=${encodeURIComponent(target)}`;
+      const url = `/attach?target=${encodeURIComponent(x.agent_id)}`;
       const safeSummary = (x.summary || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])).slice(0, 120);
       return `<tr>
         <td><code>${x.agent_id}</code></td>
@@ -1381,6 +1433,12 @@ ps -ax -o command | grep -E 'ttyd.*-a.* tmux attach' | grep -qv grep || { echo "
 ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert=true' | grep -qv grep || { echo "FAIL: ttyd not running with -t disableLeaveAlert=true — closing the HUD attach tab will prompt the user"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 # End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
 curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
+# /attach wrapper page served by queue-server (title JS + agent_id injected)
+curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'mypeople terminal' || { echo "FAIL: /attach not serving wrapper page"; exit 1; }
+curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'setTitle' || { echo "FAIL: /attach missing tab-title JS"; exit 1; }
+# dashboard attach links use /attach wrapper (not direct :7681)
+QUEUE_SECRET_VAL="$(grep ^QUEUE_SECRET= ~/.config/mypeople/queue.env | cut -d= -f2-)"
+curl -fsS -H "X-Queue-Secret: $QUEUE_SECRET_VAL" "http://127.0.0.1:9900/dashboard" | grep -q '/attach?target=' || { echo "FAIL: dashboard attach links still point to :7681 instead of /attach"; exit 1; }
 
 # tmux server (started by queue-client) MUST run with UTF-8 locale.
 # If the host default is POSIX, tmux strips multi-byte chars (●, ⏺, ✻,
