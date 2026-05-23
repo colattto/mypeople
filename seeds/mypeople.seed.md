@@ -354,14 +354,14 @@ def _tmux_inject(target, text):
 
 
 # Placeholder replacement contract (enforced in GET /attach handler):
-#   __INJECT_SECRET__      → raw SECRET value (hex token — safe as-is)
-#   __INJECT_TTYD_PORT__   → port number (digits only — safe as-is)
-#   __INJECT_TARGET__      → json.dumps(target)[1:-1]  — safe in JS string literal
-#   __INJECT_TARGET_HTML__ → html.escape(target)        — safe in HTML text context
+#   __INJECT_SECRET__    → raw SECRET value (hex token — safe as-is)
+#   __INJECT_TTYD_PORT__ → port number (digits only — safe as-is)
+#   __INJECT_TARGET__    → json.dumps(target)[1:-1] — safe in JS string literal
+#                          Tab title is set client-side: parses "host/session:tab" → "role — host | mypeople"
 ATTACH_HTML_TEMPLATE = """\
 <!doctype html>
 <html><head><meta charset="utf-8">
-<title>__INJECT_TARGET_HTML__ — mypeople terminal</title>
+<title>mypeople terminal</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { width:100vw; height:100vh; overflow:hidden; background:#000; }
@@ -390,6 +390,16 @@ const TPORT   = "__INJECT_TTYD_PORT__";
 const iframe  = document.getElementById('term');
 const overlay = document.getElementById('drop-ol');
 const toast   = document.getElementById('toast');
+// Friendly browser-tab title: "Boss — hecktor | mypeople"
+// TARGET format: "host/session:tab"  (canonicalized by the CLI before this page is served)
+(function setTitle() {
+  const slash = TARGET.indexOf('/');
+  const host  = slash >= 0 ? TARGET.slice(0, slash) : TARGET;
+  const after = slash >= 0 ? TARGET.slice(slash + 1) : TARGET;
+  const colon = after.indexOf(':');
+  const role  = colon >= 0 ? after.slice(colon + 1) : after;
+  document.title = `${role} — ${host} | mypeople`;
+})();
 // Set iframe src via JS so we can use location.hostname at runtime.
 iframe.src = `http://${location.hostname}:${TPORT}/?arg=-t&arg=${encodeURIComponent(TARGET)}`;
 
@@ -471,15 +481,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             target = qs.get("target", [""])[0]
             if not target:
                 return self._json(400, {"error": "target required"})
-            import html as _html
             ttyd_port = os.environ.get("TTYD_PORT", "7681")
-            safe_target_js   = json.dumps(target)[1:-1]   # safe in JS string literal
-            safe_target_html = _html.escape(target)         # safe in HTML text/attribute
+            safe_target_js = json.dumps(target)[1:-1]   # safe in JS string literal
             html_page = (ATTACH_HTML_TEMPLATE
                          .replace("__INJECT_SECRET__", SECRET)
                          .replace("__INJECT_TTYD_PORT__", ttyd_port)
-                         .replace("__INJECT_TARGET__", safe_target_js)
-                         .replace("__INJECT_TARGET_HTML__", safe_target_html))
+                         .replace("__INJECT_TARGET__", safe_target_js))
             data = html_page.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
