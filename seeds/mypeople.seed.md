@@ -1211,7 +1211,7 @@ def cmd_upgrade_config(cfg, args):
               "It will take effect on next tmux start.")
 
 
-COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "upgrade-config": cmd_upgrade_config}
+COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "upgrade-config": cmd_upgrade_config, "send-image": cmd_send_image}
 
 
 def main():
