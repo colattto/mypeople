@@ -352,14 +352,14 @@ def _tmux_inject(target, text):
 
 
 # Placeholder replacement contract (enforced in GET /attach handler):
-#   __INJECT_SECRET__    → raw SECRET value (hex token — no escaping needed)
-#   __INJECT_TTYD_PORT__ → port number (digits only — no escaping needed)
-#   __INJECT_TARGET__    → json.dumps(target) for JS literal; html.escape(target) for <title>
-#   NOTE: do NOT use raw .replace() for __INJECT_TARGET__ — use the helpers below.
+#   __INJECT_SECRET__      → raw SECRET value (hex token — safe as-is)
+#   __INJECT_TTYD_PORT__   → port number (digits only — safe as-is)
+#   __INJECT_TARGET__      → json.dumps(target)[1:-1]  — safe in JS string literal
+#   __INJECT_TARGET_HTML__ → html.escape(target)        — safe in HTML text context
 ATTACH_HTML_TEMPLATE = """\
 <!doctype html>
 <html><head><meta charset="utf-8">
-<title>__INJECT_TARGET__ — mypeople terminal</title>
+<title>__INJECT_TARGET_HTML__ — mypeople terminal</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { width:100vw; height:100vh; overflow:hidden; background:#000; }
@@ -469,13 +469,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             target = qs.get("target", [""])[0]
             if not target:
                 return self._json(400, {"error": "target required"})
-            import json as _json
+            import html as _html
             ttyd_port = os.environ.get("TTYD_PORT", "7681")
-            safe_target = _json.dumps(target)[1:-1]  # JSON-escapes without surrounding quotes
+            safe_target_js   = json.dumps(target)[1:-1]   # safe in JS string literal
+            safe_target_html = _html.escape(target)         # safe in HTML text/attribute
             html_page = (ATTACH_HTML_TEMPLATE
                          .replace("__INJECT_SECRET__", SECRET)
                          .replace("__INJECT_TTYD_PORT__", ttyd_port)
-                         .replace("__INJECT_TARGET__", safe_target))
+                         .replace("__INJECT_TARGET__", safe_target_js)
+                         .replace("__INJECT_TARGET_HTML__", safe_target_html))
             data = html_page.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -559,7 +561,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if p == "/upload":
             ct = self.headers.get("Content-Type", "")
+            MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
             length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > MAX_UPLOAD_BYTES:
+                return self._json(413, {"error": f"file too large (max {MAX_UPLOAD_BYTES // (1024*1024)} MB)"})
             body = self.rfile.read(length)
             fields = _parse_multipart(ct, body)
             file_entry   = fields.get("file")
@@ -568,6 +573,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "file and target fields required"})
             filename, file_bytes = file_entry
             _, target_bytes = target_entry
+            if not file_bytes:
+                return self._json(400, {"error": "empty file"})
             target_str = target_bytes.decode("utf-8", errors="replace").strip()
             ext = os.path.splitext(filename or "")[1] or ".png"
             upload_dir = os.path.join(INSTALL_DIR, "uploads")
@@ -1176,7 +1183,11 @@ def cmd_send_image(cfg, args):
     os.makedirs(upload_dir, exist_ok=True)
     ext = os.path.splitext(src)[1] or ".png"
     dst = os.path.join(upload_dir, f"{_uuid.uuid4().hex}{ext}")
-    shutil.copy2(src, dst)
+    try:
+        shutil.copy2(src, dst)
+    except OSError as e:
+        print(f"Failed to copy image: {e}", file=sys.stderr)
+        sys.exit(1)
     body = {"action": "send", "target_agent": aid, "payload": {"message": dst}}
     t = submit_and_wait(cfg, body, timeout=10)
     if t["status"] == "done":
