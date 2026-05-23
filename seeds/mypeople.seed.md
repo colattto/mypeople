@@ -585,13 +585,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not file_bytes:
                 return self._json(400, {"error": "empty file"})
             target_str = target_bytes.decode("utf-8", errors="replace").strip()
+            # Derive tmux_target from agent_id without registry lookup.
+            # agent_id format: "host/session:tab"  →  tmux target: "mc-session:tab"
+            # Fallback: treat as tmux target directly if format doesn't match.
+            if "/" in target_str and ":" in target_str:
+                after_slash = target_str.split("/", 1)[1]   # "session:tab"
+                bare_sess, _, tab = after_slash.partition(":")
+                mc_sess = bare_sess if bare_sess.startswith("mc-") else f"mc-{bare_sess}"
+                tmux_target = f"{mc_sess}:{tab}"
+            else:
+                tmux_target = target_str
             ext = os.path.splitext(filename or "")[1] or ".png"
             upload_dir = os.path.join(INSTALL_DIR, "uploads")
             os.makedirs(upload_dir, exist_ok=True)
             save_path = os.path.join(upload_dir, f"{uuid.uuid4().hex}{ext}")
             with open(save_path, "wb") as fh:
                 fh.write(file_bytes)
-            ok, err = _tmux_inject(target_str, save_path)
+            ok, err = _tmux_inject(tmux_target, save_path)
             if ok:
                 return self._json(200, {"ok": True, "path": save_path})
             return self._json(500, {"ok": False, "error": err})
