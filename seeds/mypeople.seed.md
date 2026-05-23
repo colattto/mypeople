@@ -556,6 +556,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(401, {"error": "unauthorized"})
         u = urlparse(self.path)
         p = u.path
+
+        if p == "/upload":
+            ct = self.headers.get("Content-Type", "")
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length)
+            fields = _parse_multipart(ct, body)
+            file_entry   = fields.get("file")
+            target_entry = fields.get("target")
+            if not file_entry or not target_entry:
+                return self._json(400, {"error": "file and target fields required"})
+            filename, file_bytes = file_entry
+            _, target_bytes = target_entry
+            target_str = target_bytes.decode("utf-8", errors="replace").strip()
+            ext = os.path.splitext(filename or "")[1] or ".png"
+            upload_dir = os.path.join(INSTALL_DIR, "uploads")
+            os.makedirs(upload_dir, exist_ok=True)
+            save_path = os.path.join(upload_dir, f"{uuid.uuid4().hex}{ext}")
+            with open(save_path, "wb") as fh:
+                fh.write(file_bytes)
+            ok, err = _tmux_inject(target_str, save_path)
+            if ok:
+                return self._json(200, {"ok": True, "path": save_path})
+            return self._json(500, {"ok": False, "error": err})
+
         data = self._read_json()
         if data is None:
             return self._json(400, {"error": "bad json"})
@@ -1127,6 +1151,39 @@ def cmd_kill(cfg, args):
         print(f"Killed {aid}")
     else:
         print(f"Kill FAILED: {t.get('error', '?')}", file=sys.stderr); sys.exit(1)
+
+
+def cmd_send_image(cfg, args):
+    """Copy a local image to ~/mypeople/uploads/ and send its path to an agent.
+
+    The path is typed into the agent's pane via tmux bracketed-paste, where
+    Claude Code reads it as an image attachment — identical to dragging a
+    file into a native terminal session.
+
+    Usage: mp send-image <agent_id> <image_path>
+    """
+    if len(args) < 2:
+        print("Usage: mp send-image <agent_id> <image_path>", file=sys.stderr)
+        sys.exit(2)
+    aid = canonicalize_agent_id(args[0], cfg["HOST_ID"])
+    src = os.path.expanduser(args[1])
+    if not os.path.isfile(src):
+        print(f"File not found: {src}", file=sys.stderr)
+        sys.exit(1)
+    import shutil, uuid as _uuid
+    install_dir = os.path.expanduser(cfg.get("INSTALL_DIR", "~/mypeople"))
+    upload_dir = os.path.join(install_dir, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    ext = os.path.splitext(src)[1] or ".png"
+    dst = os.path.join(upload_dir, f"{_uuid.uuid4().hex}{ext}")
+    shutil.copy2(src, dst)
+    body = {"action": "send", "target_agent": aid, "payload": {"message": dst}}
+    t = submit_and_wait(cfg, body, timeout=10)
+    if t["status"] == "done":
+        print(f"Image sent to {aid}: {dst}")
+    else:
+        print(f"Send FAILED: {t.get('error', '?')}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_upgrade_config(cfg, args):
