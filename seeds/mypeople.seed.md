@@ -325,6 +325,8 @@ def _tmux_inject(target, text):
     Mirrors tmux_send_text in queue-client — kept in sync manually.
     Called directly by the /upload handler (no queue roundtrip needed
     since queue-server is always co-located with tmux on the same host).
+    The post-injection pane-mode check is best-effort cleanup; it does
+    not guarantee pane_in_mode == 0 on return (mirrors tmux_send_text behaviour).
     """
     PASTE_START = "\x1b[?2004h\x1b[200~"
     PASTE_END   = "\x1b[201~\x1b[?2004l"
@@ -1173,6 +1175,14 @@ def cmd_send_image(cfg, args):
         print("Usage: mp send-image <agent_id> <image_path>", file=sys.stderr)
         sys.exit(2)
     aid = canonicalize_agent_id(args[0], cfg["HOST_ID"])
+    # send-image uploads to the local filesystem then sends the path.
+    # This only works when the target agent runs on this same host.
+    target_host = aid.split("/", 1)[0]
+    if target_host != cfg["HOST_ID"]:
+        print(f"send-image requires target agent on this host ({cfg['HOST_ID']}); "
+              f"got {target_host}. Use the /attach browser UI to send images to remote agents.",
+              file=sys.stderr)
+        sys.exit(1)
     src = os.path.expanduser(args[1])
     if not os.path.isfile(src):
         print(f"File not found: {src}", file=sys.stderr)
