@@ -1415,7 +1415,7 @@ curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q '__INJECT
 curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'pointer-events' || { echo "FAIL: /attach missing pointer-events drag fix"; exit 1; }
 
 # /upload rejects missing secret
-curl -fsS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:9900/upload" | grep -q '401' || { echo "FAIL: /upload should 401 without secret"; exit 1; }
+curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:9900/upload" | grep -q '401' || { echo "FAIL: /upload should 401 without secret"; exit 1; }
 
 # dashboard attach links point to /attach (not direct :7681)
 QUEUE_SECRET_VAL="$(grep ^QUEUE_SECRET= ~/.config/mypeople/queue.env | cut -d= -f2-)"
