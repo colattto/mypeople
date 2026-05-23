@@ -243,6 +243,8 @@ unbind-key -T root WheelDownPane
 run '~/.tmux/plugins/tpm/tpm'
 EOF
 chmod 644 "$HOME/.tmux.conf"
+# Save canonical copy so `mp upgrade-config` can re-apply without re-running the full seed.
+cp "$HOME/.tmux.conf" "$INSTALL_DIR/tmux.conf"
 
 # Clone the one plugin TPM would install on first prefix-I anyway.
 # TPM's install_plugins.sh requires an already-running tmux server with
@@ -814,6 +816,7 @@ def load_env():
     cfg["QUEUE_URL"] = os.environ.get("QUEUE_URL", cfg.get("QUEUE_URL", "http://127.0.0.1:9900"))
     cfg["QUEUE_SECRET"] = os.environ.get("QUEUE_SECRET", cfg.get("QUEUE_SECRET", ""))
     cfg["HOST_ID"] = os.environ.get("HOST_ID", cfg.get("HOST_ID", "")) or _hostname()
+    cfg["INSTALL_DIR"] = os.environ.get("INSTALL_DIR", cfg.get("INSTALL_DIR", str(Path.home() / "mypeople")))
     return cfg
 
 
@@ -956,7 +959,32 @@ def cmd_kill(cfg, args):
         print(f"Kill FAILED: {t.get('error', '?')}", file=sys.stderr); sys.exit(1)
 
 
-COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill}
+def cmd_upgrade_config(cfg, args):
+    """Re-apply the canonical tmux config saved at install time.
+
+    Copies ~/mypeople/tmux.conf → ~/.tmux.conf and reloads the running
+    tmux server. Fixes hosts where the installed ~/.tmux.conf pre-dates
+    a seed update (e.g. missing WheelUpPane unbinds or copy-pipe-and-cancel).
+    Safe to run with live agents — only config is touched, no panes are killed.
+    """
+    install_dir = os.path.expanduser(cfg.get("INSTALL_DIR", "~/mypeople"))
+    src = os.path.join(install_dir, "tmux.conf")
+    dst = os.path.expanduser("~/.tmux.conf")
+    if not os.path.exists(src):
+        print(f"Canonical config not found at {src}.\n"
+              "Re-run the seed to regenerate it.", file=sys.stderr)
+        sys.exit(1)
+    import shutil
+    shutil.copy2(src, dst)
+    r = subprocess.run(["tmux", "source-file", dst], capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"Config updated: {src} → {dst} (tmux reloaded)")
+    else:
+        print(f"Config written to {dst} but tmux reload failed (no server running?).\n"
+              "It will take effect on next tmux start.")
+
+
+COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "upgrade-config": cmd_upgrade_config}
 
 
 def main():
@@ -1381,6 +1409,20 @@ ps -ax -o command | grep -E 'ttyd.*-a.* tmux attach' | grep -qv grep || { echo "
 ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert=true' | grep -qv grep || { echo "FAIL: ttyd not running with -t disableLeaveAlert=true — closing the HUD attach tab will prompt the user"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 # End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
 curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
+# /attach wrapper page served by queue-server
+curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'mypeople — terminal' || { echo "FAIL: /attach not serving wrapper page"; exit 1; }
+curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q '__INJECT_SECRET__' && { echo "FAIL: /attach didn't inject secret"; exit 1; }
+curl -fsS "http://127.0.0.1:9900/attach?target=mc-main:Boss" | grep -q 'pointer-events' || { echo "FAIL: /attach missing pointer-events drag fix"; exit 1; }
+
+# /upload rejects missing secret
+curl -fsS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:9900/upload" | grep -q '401' || { echo "FAIL: /upload should 401 without secret"; exit 1; }
+
+# dashboard attach links point to /attach (not direct :7681)
+QUEUE_SECRET_VAL="$(grep ^QUEUE_SECRET= ~/.config/mypeople/queue.env | cut -d= -f2-)"
+curl -fsS -H "X-Queue-Secret: $QUEUE_SECRET_VAL" "http://127.0.0.1:9900/dashboard" | grep -q '/attach?target=' || { echo "FAIL: dashboard attach links still point to :7681 instead of /attach"; exit 1; }
+
+# mp send-image --help / usage
+mp send-image 2>&1 | grep -q 'Usage: mp send-image' || { echo "FAIL: mp send-image missing usage"; exit 1; }
 
 # tmux server (started by queue-client) MUST run with UTF-8 locale.
 # If the host default is POSIX, tmux strips multi-byte chars (●, ⏺, ✻,
