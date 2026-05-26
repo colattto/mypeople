@@ -232,12 +232,18 @@ bind-key   -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "
 
 # ── Mouse-wheel scroll ────────────────────────────────────
 # Claude TUI renders on the MAIN screen (alternate_on=0) and does not
-# request mouse mode, so tmux's default WheelUpPane binding falls through
-# to `copy-mode -e` and silently traps every subsequent keystroke until
-# Escape. Kill the wheel→copy-mode path entirely. Users who want scrollback
-# can still enter copy-mode explicitly via `prefix [`.
-unbind-key -T root WheelUpPane
-unbind-key -T root WheelDownPane
+# request mouse mode. Guard against the silent-trap: if already in copy-mode
+# just scroll; if not, enter copy-mode then scroll. WheelDown outside
+# copy-mode is a no-op (already at bottom). tmux_send_text() independently
+# cancels copy-mode before any programmatic send, so automated paths are safe.
+bind -T root WheelUpPane \
+  if -F "#{pane_in_mode}" \
+    "send-keys -X -N 3 scroll-up" \
+    "copy-mode -e; send-keys -X -N 3 scroll-up"
+bind -T root WheelDownPane \
+  if -F "#{pane_in_mode}" \
+    "send-keys -X -N 3 scroll-down" \
+    ""
 
 # ── TPM (must be last) ────────────────────────────────────
 run '~/.tmux/plugins/tpm/tpm'
@@ -290,7 +296,7 @@ def _host_of(agent_id):
 ATTACH_HTML_TEMPLATE = """\
 <!doctype html>
 <html><head><meta charset="utf-8">
-<title>mypeople terminal</title>
+<title>Colattto terminal</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { width:100vw; height:100vh; overflow:hidden; background:#000; }
@@ -309,7 +315,7 @@ const TPORT  = "__INJECT_TTYD_PORT__";
   const after = slash >= 0 ? TARGET.slice(slash + 1) : TARGET;
   const colon = after.indexOf(':');
   const role  = colon >= 0 ? after.slice(colon + 1) : after;
-  document.title = `${role} — ${host} | mypeople`;
+  document.title = `${role} — ${host} | Colattto`;
 })();
 document.getElementById('term').src =
   `http://${location.hostname}:${TPORT}/?arg=-t&arg=${encodeURIComponent(TARGET)}`;
@@ -1144,7 +1150,7 @@ chmod +x "$INSTALL_DIR/plugins/tmux-boss-hooks/hooks/emit-event"
 ```bash
 cat > "$INSTALL_DIR/bin/dashboard.html" <<'HTML_EOF'
 <!doctype html>
-<html><head><meta charset="utf-8"><title>mypeople — HUD</title>
+<html><head><meta charset="utf-8"><title>Colattto — HUD</title>
 <style>
   body { font: 14px -apple-system,system-ui; margin: 24px; background: #f4f4f4; color: #111; }
   h1 { margin: 0 0 12px; font-size: 20px; }
@@ -1160,7 +1166,7 @@ cat > "$INSTALL_DIR/bin/dashboard.html" <<'HTML_EOF'
   .summary { color: #444; }
 </style></head>
 <body>
-<h1>mypeople — HUD</h1>
+<h1>Colattto — HUD</h1>
 <div class="meta">Refreshed: <span id="ts">never</span> · <span id="clients">? clients</span></div>
 <table>
   <thead><tr><th>agent_id</th><th>state</th><th>backend</th><th>boss</th><th>summary</th><th>attach</th></tr></thead>
