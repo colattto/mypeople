@@ -2,7 +2,7 @@
 
 > A self-contained product-spec "seed" for **Almanac** — a Next.js 14 design-review app (Google/@plow.co auth, anchored comment pins on iframed artifacts, presence, agent-reviewer API).
 > **To build:** hand this file to a coding agent — it builds the app and self-runs the §16 acceptance journeys.
-> **Hardened against the PRODUCTION Almanac (real gate, not self-baseline) — index AND deep screens.** A blind, zero-context agent rebuilt this spec from scratch and was compared against the live production app (not self-generated baselines) by computed-style + side-by-side screenshot, with identical seeded data (a project · 2 versions · 3 anchored pins · reply · reaction · resolved). **Index: 5/5** — project-row name = DM Sans (not serif), mono-UPPERCASE casing (`ALMANAC` / `+ NEW PROJECT`) with `sign out` lowercase, leading `•` bullet, the outlined active filter pill (`#fff` + 1px midnight border + 999px radius + dot), chalk bg / Instrument Serif hero / DM Mono. **Deep screens:** the **anchored comment pins paint** on the iframed artifact at the exact stored `(x,y)` (the §8.4 iframe-load gate — load counter + mount catch-up for the load-before-hydration race — was the make-or-break detail; without it `loadCount` stays 0 and 0 pins ever paint), the **pin popover** opens with comment + reaction + reply, and the **activity panel** lists the thread. Functional journeys (§16, 1–22) pass; visual journeys (23–27) gate against **production** baselines.
+> **Self-contained & self-verifying (proven).** A blind, zero-context agent — with **no access to the original Almanac** (no production instance, no golden screenshots, no second app) — rebuilt this spec from scratch and ran the seed's own `## Verify`: **27/27 §16 journeys PASS against only its own build (localhost)**. The visual journeys (J23–J27) assert **computed-style / DOM against the ABSOLUTE values written in §9** — never by diffing another running app. Index 5/5 (DM Sans row name, mono-UPPERCASE casing, outlined active pill, `•` bullet, chalk/serif/mono) and the deep screens (anchored pins paint via the §8.4 iframe-load gate + mount catch-up, pin popover, activity panel) are all specified by absolute value, so the implementer never needs the original to verify fidelity. (An earlier draft told the verifier to screenshot-diff against the *production* Almanac — that made the seed non-self-contained; it is fixed: §9 now carries every value the gate asserts.)
 
 > seed-format: 1
 
@@ -954,11 +954,20 @@ hitting `http://localhost:3210`. It must:
 - print enough to debug failures,
 - finish in < 5 min for the core path.
 
-A reference build ships in the repo with a large Playwright suite under `tests/e2e/`
-(`verify-comment-flow`, `verify-resolve`, `verify-draggable-pins`, `verify-agent-artifact`,
-`verify-agent-comment`, `verify-anchor-text`, `verify-version-switcher`, `verify-activity`,
-`verify-responsive`, `verify-3-level-migration`, …). Treat those as the executable form of
-§16 — green suite ⇒ proven for this agent.
+> **Self-contained — no reference instance.** Verify drives **only the app this seed built**,
+> on `localhost:3210`. It does **NOT** require the production Almanac, any other running
+> instance, or golden screenshots captured from one. Visual fidelity (J23–J27) is asserted
+> against the **absolute values in §9**, not by diffing another app. If any check here needs a
+> second/real instance to pass, that is a seed bug — fix the seed (make §9 carry the value),
+> not the harness. A fresh blind agent on a clean machine with **no Almanac anywhere** must be
+> able to reach exit 0.
+
+The reference implementation (`github.com/plow-pbc/almanac`) ships a Playwright suite under
+`tests/e2e/` (`verify-comment-flow`, `verify-resolve`, `verify-draggable-pins`,
+`verify-agent-artifact`, `verify-anchor-text`, `verify-version-switcher`, `verify-activity`,
+`verify-responsive`, `verify-3-level-migration`, …) — listed only as an **illustration** of
+what §16 looks like in executable form. It is **not** a dependency of this seed; your build
+authors its own equivalent suite from §16.
 
 ---
 
@@ -1037,21 +1046,24 @@ Each states an action and the observable expected result. Manual or headless (Pl
 
 ### Visual fidelity (the rebuild must *look* like §9, not just function)
 
-Functional journeys 1–22 pass even on a wrong-looking build, so add these. Two tiers:
-**computed-style assertions** (deterministic, primary) and **screenshot diff** (high-fidelity
-gate). All run after a `@plow.co` test session is established.
+Functional journeys 1–22 pass even on a wrong-looking build, so add these. The fidelity gate
+is **computed-style / DOM assertions against the ABSOLUTE values written in §9** — and it is
+**fully self-contained**: it requires **no reference instance, no production Almanac, no
+golden screenshots**. The implementer never has the original app; §9 carries every value
+(fonts, weights, colors, shadows, hover deltas, casing, layout) precisely enough that
+asserting the build against those literals IS the fidelity check.
 
-> **The gate must compare against the REAL Almanac — never against itself.** A self-captured
-> `toHaveScreenshot` baseline only proves the build is consistent with *itself*; it certifies
-> nothing about fidelity to production. (This bit us: a build with **serif** project-row
-> titles — a direct violation of §9.2, which pins row names to **sans** — passed "27/27"
-> because the computed checks sampled only `body`/`h1`/a mono label, and the screenshot baseline
-> was self-generated.) Two consequences, both load-bearing: (a) the computed-style checks must
-> sample the elements that actually drift — **project-row name, pill casing, metadata layout** —
-> not just the global tokens; (b) the screenshot baselines in J27 must be **captured from the
-> production Almanac** (`github.com/plow-pbc/almanac`, run locally with a minted `@plow.co`
-> session, or pulled from the deployed app) and shipped/committed as goldens — a baseline the
-> build generated from itself is not a gate.
+> **Assert against §9's absolute values, NOT against another running app.** Earlier drafts of
+> this seed told the verifier to screenshot-diff against the *production* Almanac. That was a
+> mistake: it made the seed non-self-contained (a real implementer has no production instance
+> to diff against) and it outsourced fidelity to an external app instead of to this spec. The
+> rule now: **every visual check reads computed style / DOM geometry and compares to the
+> literal value in §9.** The lesson that motivated the old rule still holds — **sample the
+> elements that actually drift** (project-row name font, pill casing, active-pill outline,
+> metadata layout, leading bullet), not just `body`/`h1`/one mono label — but the comparand is
+> **§9, not production**. (A self-captured screenshot baseline only proves a build is
+> consistent with itself, so screenshot-diff is at most an **optional same-build regression
+> aid**, never the fidelity gate — see J27.)
 
 23. **Fonts resolve correctly — including the row name.** Via `getComputedStyle`: `body`
     `font-family` resolves to a **DM Sans** stack; the hero/page-title `h1` resolves to
@@ -1072,16 +1084,31 @@ gate). All run after a `@plow.co` test session is established.
 26. **Transition feel.** Computed `transition-duration`/`timing-function` on the sampled
     interactive elements are from the §9.3 ladder (default **180ms ease-out**; panel slide
     **220ms**). *Expect:* no `0s`/`linear` defaults left on interactive elements.
-27. **Screenshot diff vs the PRODUCTION Almanac (real gate, not self-baseline).** Baselines of:
-    index, version-bar + iframe, an open pin popover, the activity panel, a modal — each
-    **captured from the real Almanac** (run `github.com/plow-pbc/almanac` locally with a minted
-    `@plow.co` session, same 1280×900 viewport, or pull from the deployed app) and committed as
-    goldens. Compare the rebuild with Playwright `toHaveScreenshot` (~0.2% threshold). *Expect:*
-    within threshold vs the **production** baselines — flags casing (`ALMANAC`/`+ NEW PROJECT`
-    vs lowercase), row typography (sans + leading bullet vs serif), metadata position
-    (right-aligned vs stacked), filter-pill treatment, and the type-scale/density drift the
-    computed checks can't. A baseline the build captured from itself does **not** satisfy this
-    journey — the comparison is circular and the result is void.
+27. **Layout / casing / typography assertions vs §9 (self-contained — the real fidelity gate).**
+    Read DOM + `getComputedStyle` on the **own** build and assert against the literal §9 values
+    — no external app:
+    - **Row name = sans, normal.** `.project-row .name` (or the rename target inside it)
+      `font-family` resolves to the **DM Sans** stack, `font-style: normal` (⚠️ a serif/italic
+      row title fails — the #1 historical miss).
+    - **Leading bullet.** Each project row shows a leading **`•`** marker before the name
+      (assert a visible bullet glyph / `::before` content / list-marker — §9.8).
+    - **Label casing.** The active filter pill renders **`ACTIVE`** (computed
+      `text-transform: uppercase` *or* the rendered text is all-caps); the brand suffix is
+      **`ALMANAC`**, the CTA **`+ NEW PROJECT`** (uppercase); **but** `sign out`, the
+      version-bar hint, and row meta/counts are **lowercase** (§9.2).
+    - **Active filter pill = outlined, not filled.** Computed on the active pill:
+      `border-radius` = `999px`, `border-width` ≈ `1px` with `border-color` = `rgb(1,0,10)`
+      (midnight), `background` = `rgb(255,255,255)` (`--card-bg`) — **not** transparent/`0`
+      border and **not** a solid volt fill (§9.3 concrete pill spec).
+    - **Metadata layout.** In a project row the `N options · M pins` meta + `open →` sit on the
+      **name's baseline** (same grid row, right side), and only `updated <rel>` wraps to a
+      second line — **not** all stacked under the name (§9.8).
+    *Expect:* every assertion matches the §9 literal. This is the gate that catches the
+    casing/row-typography/pill/metadata drift the global-token checks (J24) miss.
+    **Optional regression aid (NOT a fidelity gate):** a project may *also* keep its **own**
+    `toHaveScreenshot` baselines to catch unintended self-regressions between commits. That is
+    explicitly **not** part of passing this seed and needs **no** reference instance — fidelity
+    is established by the assertions above against §9, period.
 
 ---
 
