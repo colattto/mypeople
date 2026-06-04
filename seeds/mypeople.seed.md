@@ -21,6 +21,7 @@ Each independently verifiable from a fresh shell.
 - `queue-server` and `queue-client` processes both alive in `ps`.
 - `ttyd` running with `tmux attach` so per-tab attach URLs work.
 - tailscaled running, node online on the tailnet, HUD + ttyd reachable on the tailscale IP.
+- **Liveness is heartbeat-based**: an agent whose host stops heartbeating (e.g. its container is removed) auto-drops from `/agents` and the HUD within `QUEUE_DEAD_AFTER` seconds — no zombie agents lingering as `alive` after `mp kill` times out on a dead host. The reaper also prunes the dead host from `/clients`.
 
 **Boss role:**
 - `~/mypeople/boss-CLAUDE.md` is installed (the Boss's job description, inlined in this seed).
@@ -38,6 +39,7 @@ Each independently verifiable from a fresh shell.
 |---|---|---|---|---|
 | `QUEUE_PORT` | no | `9900` | port free or our own server | "TCP port (default 9900)" |
 | `QUEUE_SECRET` | no | (auto) | existing key in `queue.env` | "Reuse or auto-gen" |
+| `QUEUE_DEAD_AFTER` | no | `4 × QUEUE_HEARTBEAT` (120s) | env | (no prompt — secs a host can be silent before its agents are reaped from the HUD; 4 missed heartbeats is generous so a loaded host isn't false-reaped) |
 | `INSTALL_DIR` | no | `$HOME/mypeople` | dir exists | default |
 | `HOST_ID` | no | `$(hostname -s)` | `hostname -s` works | default |
 | OS deps (`tmux python3 jq procps`) | yes | apt | `command -v` each | (no prompt — agent runs apt install non-interactively) |
@@ -50,7 +52,7 @@ Each independently verifiable from a fresh shell.
 
 | Component | Source | Notes |
 |---|---|---|
-| `queue-server.py` | inline | HTTP queue: clients, agents, task submit/poll/result, dashboard |
+| `queue-server.py` | inline | HTTP queue: clients, agents, task submit/poll/result, dashboard; heartbeat reaper auto-prunes agents on hosts that stop heartbeating |
 | `queue-client.py` | inline | heartbeat + task dispatcher; tmux input via bracketed-paste |
 | `mp` CLI | inline | `spawn / send / peek / kill / status` |
 | `plugins/tmux-boss-hooks/` | inline | Claude Code hooks plugin: SessionStart / Stop / SessionEnd → status file + boss notification |
@@ -269,6 +271,16 @@ from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("QUEUE_PORT", "9900"))
 SECRET = os.environ.get("QUEUE_SECRET", "")
+HEARTBEAT = int(os.environ.get("QUEUE_HEARTBEAT", "30"))
+# Heartbeat-based liveness. An agent's host re-heartbeats every HEARTBEAT secs;
+# a removed container stops heartbeating, so we mark its agents dead once the
+# host has been silent for DEAD_AFTER secs (default = 4 missed heartbeats —
+# generous so a loaded host isn't false-reaped) and the reaper drops them from
+# the registry / HUD. Without this an agent whose container is gone shows
+# 'alive' forever, because `state` is written once at register and `mp kill`
+# times out on a dead host. Tune via QUEUE_DEAD_AFTER / QUEUE_REAP_INTERVAL.
+DEAD_AFTER = float(os.environ.get("QUEUE_DEAD_AFTER", str(HEARTBEAT * 4)))
+REAP_INTERVAL = float(os.environ.get("QUEUE_REAP_INTERVAL", str(max(5, HEARTBEAT // 2))))
 START_TS = time.time()
 
 _lock = threading.Lock()
@@ -281,6 +293,41 @@ def _host_of(agent_id):
     if "/" in agent_id and ":" in agent_id:
         return agent_id.split("/", 1)[0]
     return ""
+
+
+def _agent_alive(v, now):
+    """True iff the agent's host heartbeated within DEAD_AFTER seconds.
+
+    The host's queue-client heartbeats on a fixed interval; when its container
+    is removed the heartbeats stop, so its agents age out of 'alive'. Falls back
+    to the agent's own register ts when the host has no heartbeat yet (the
+    spawn/heartbeat race right after register), so a just-registered agent on a
+    not-yet-heartbeated host isn't reaped. Call under _lock."""
+    c = clients.get(v.get("host", ""))
+    last = c.get("ts", 0) if c else v.get("ts", 0)
+    return (now - last) <= DEAD_AFTER
+
+
+def reaper_loop():
+    """Drop agents whose host stopped heartbeating, plus stale clients, so the
+    registry and the HUD reflect true current liveness instead of last-known
+    state. This is what keeps a removed container's agent from showing 'alive'
+    forever (the zombie-agent bug)."""
+    while True:
+        time.sleep(REAP_INTERVAL)
+        now = time.time()
+        with _lock:
+            dead_agents = [k for k, v in agents.items() if not _agent_alive(v, now)]
+            for k in dead_agents:
+                agents.pop(k, None)
+            dead_clients = [h for h, c in clients.items()
+                            if now - c.get("ts", 0) > DEAD_AFTER]
+            for h in dead_clients:
+                clients.pop(h, None)
+        if dead_agents or dead_clients:
+            sys.stderr.write(
+                f"{time.strftime('%H:%M:%S')} reaper pruned "
+                f"agents={dead_agents} clients={dead_clients}\n")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -335,9 +382,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, [{"hostname": h, **v} for h, v in clients.items()])
         if p == "/agents":
             install_dir = os.environ.get("INSTALL_DIR", os.path.expanduser("~/mypeople"))
+            now = time.time()
             with _lock:
                 items = []
                 for k, v in agents.items():
+                    # Heartbeat-based liveness: never surface an agent whose host
+                    # has gone silent (removed container) even if the reaper
+                    # hasn't swept it yet — the HUD must show TRUE current state.
+                    if not _agent_alive(v, now):
+                        continue
                     item = {"agent_id": k, **v}
                     # `session` in the registry is the BARE session name (e.g.
                     # "main"); the tmux session name and status-dir name both
@@ -470,7 +523,9 @@ if __name__ == "__main__":
     # reachable from outside this host (e.g. another tailnet node) via
     # the tailscale IP after Step 8.5.
     server = ThreadingServer(("0.0.0.0", PORT), Handler)
-    print(f"queue-server listening on 0.0.0.0:{PORT}", flush=True)
+    threading.Thread(target=reaper_loop, daemon=True).start()
+    print(f"queue-server listening on 0.0.0.0:{PORT} "
+          f"(reaper: dead_after={DEAD_AFTER:.0f}s every {REAP_INTERVAL:.0f}s)", flush=True)
     server.serve_forever()
 PY_EOF
 chmod +x "$INSTALL_DIR/bin/queue-server.py"
@@ -1375,6 +1430,25 @@ echo "$AGENTS_JSON" | jq -e --arg a "$HOST_ID/main:Boss" '.[] | select(.agent_id
   echo "FAIL: /agents didn't merge Boss summary"; echo "$AGENTS_JSON"; exit 1
 }
 echo "$AGENTS_JSON" | jq -e '.[] | .tmux_target' >/dev/null || { echo "FAIL: /agents missing tmux_target"; exit 1; }
+
+# --- heartbeat-based liveness: zombie agents auto-prune ---
+# Prove the reaper on a throwaway instance with tiny thresholds so the test is
+# ~5s, not QUEUE_DEAD_AFTER long, and never touches the real :9900 server.
+( export QUEUE_SECRET=verifyprune QUEUE_PORT=9971 QUEUE_DEAD_AFTER=2 QUEUE_REAP_INTERVAL=1 QUEUE_HEARTBEAT=1
+  python3 -u "$INSTALL_DIR/bin/queue-server.py" >/tmp/v-prune.log 2>&1 &
+  TPID=$!
+  for i in $(seq 1 20); do curl -fsS http://127.0.0.1:9971/health >/dev/null 2>&1 && break; sleep 0.1; done
+  PH(){ curl -fsS -H "X-Queue-Secret: verifyprune" "$@"; }
+  PH -X POST -H 'Content-Type: application/json' -d '{"hostname":"livehost"}' http://127.0.0.1:9971/heartbeat >/dev/null
+  PH -X POST -H 'Content-Type: application/json' -d '{"agent_id":"livehost/main:w","backend":"claude"}' http://127.0.0.1:9971/agents/register >/dev/null
+  PH -X POST -H 'Content-Type: application/json' -d '{"agent_id":"deadhost/main:w","backend":"claude"}' http://127.0.0.1:9971/agents/register >/dev/null
+  # keep livehost heartbeating across the dead window; deadhost goes silent
+  for i in 1 2 3 4; do sleep 1; PH -X POST -H 'Content-Type: application/json' -d '{"hostname":"livehost"}' http://127.0.0.1:9971/heartbeat >/dev/null; done
+  AGENTS=$(PH http://127.0.0.1:9971/agents)
+  kill $TPID 2>/dev/null
+  echo "$AGENTS" | jq -e '.[] | select(.agent_id=="livehost/main:w")' >/dev/null || { echo "FAIL: reaper killed a still-heartbeating agent"; exit 1; }
+  echo "$AGENTS" | jq -e '.[] | select(.agent_id=="deadhost/main:w")' >/dev/null && { echo "FAIL: zombie agent on a dead host was NOT reaped"; exit 1; }
+) || exit 1
 
 # ttyd alive on its port
 TTYD_PORT="$(grep ^TTYD_PORT= ~/.config/mypeople/queue.env 2>/dev/null | cut -d= -f2- || echo 7681)"
