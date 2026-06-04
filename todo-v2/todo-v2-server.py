@@ -119,7 +119,7 @@ def cron_loop():
         time.sleep(PING_CRON)
         for tid in list(load()["tasks"].keys()):
             t = load()["tasks"].get(tid)
-            if t and ACTIVE(t) and not t.get("assignee"):
+            if t and ACTIVE(t) and not t.get("assignee") and t.get("state") != "blocked":
                 reason = "needs brainstorm" if t["state"] == "needs_brainstorm" \
                          else "ready & unassigned — assign+dispatch"
                 boss_ping(tid, f"cron(unassigned): {reason}")
@@ -274,8 +274,10 @@ def apply_status(d):
             if d["state"] == "done" and not t.get("verified"):
                 return {"error": "cannot set done without verified"}
             t["state"] = d["state"]
+        if d.get("ceoGated"):           # engineer signals done-pending-CEO -> blocked (CEO window/decision gates it)
+            t["state"] = "blocked"      # the watchdog + unassigned cron skip 'blocked' -> no false stall-nag
         t["updated"] = now(); save(b)
-        return {"ok": True}
+        return {"ok": True, "state": t["state"]}
 
 def apply_proof(d):
     with _lock:

@@ -32,6 +32,15 @@ Run the reconcile pass (`todo-reconcile` encodes the deterministic part; you sup
      again if they go idle without finishing.
 4. **Never** set `done` without `verified` (the server enforces this too).
 
+### Done-pending-CEO -> blocked (don't let the watchdog nag a finished engineer)
+When an engineer reports its **actionable work is complete** but the only remaining step is **gated on
+a CEO window or decision** (e.g. a reboot-test, a publish confirm, a human review) — the engineer is
+*legitimately idle, not stalled*. Move the card to **`blocked`** (not `working`, not `done`):
+`POST /todo/status {id, ceoGated:true, lastStatus:"<what's done> — awaiting CEO <window/decision>"}`.
+The assigned-idle WATCHDOG (machine c) and the unassigned cron (machine a) both **skip `blocked`**, so
+the Boss stops getting false stall-pings while the card stays honestly **not done** (verified=false).
+When the CEO acts, move it back to `working` (more engineer work) or verify -> `done`.
+
 ### Verification authority
 You verify (D3). Machine-checkable conditions (e.g. "file <path> contains <text>", "GET <url>
 returns <code>") are auto-checked by `todo-reconcile`; anything else needs your judgment over the

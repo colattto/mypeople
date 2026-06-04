@@ -98,16 +98,17 @@
       "brainstorm": "Scope (Boss, no open questions): boot-time auto-recovery so the airbnb manager comes back by itself after a machine reboot \u2014 cloudflared tunnel up, Hostex auto-repatch, streams auto-restart, and stack restart policies. Fold the recovery into the airbnb seed.",
       "workToDone": true,
       "assignee": "daniels-MacBook-Pro-2/airbnb:eng-1",
-      "state": "working",
+      "state": "blocked",
       "verified": false,
-      "lastStatus": "Webhook AUTHENTICATED (secret-path). ngrok stable reserved-domain tunnel LIVE + reboot-proof systemd service; Cloudflare retired. Sam prod 6/6, /health 200 ext, streams 5/5 (Gather restored). REMAINING before done: seed-folding checklist (all changes into seed-hermes-airbnb-manager) + make Gather screen-grant headless so reboot needs no manual click + actual reboot-test.",
+      "lastStatus": "BUILD COMPLETE + verified on remote (PR #21, plow-pbc/seed-hermes-airbnb-manager v0.6.0): webhook secret-path auth, ngrok reboot-proof boot-service, Hostex re-point, stream/stack restart policies, AND Gather screen-grant HEADLESS on reboot (restore token + persistent mode, commit 3247e86 verified on remote - no manual click). ALL folded into the seed. ONLY remaining: an actual reboot-test to prove end-to-end recovery - CEO-gated (blinks live feed ~10-15s). Engineer work DONE; awaiting CEO reboot-window.",
       "proofs": [],
       "subs": [],
-      "pingsToBoss": 3,
+      "pingsToBoss": 5,
       "assignedAt": 1780525302342,
       "lastStopTs": null,
       "created": 1780525170118,
-      "updated": 1780583136479
+      "updated": 1780585663519,
+      "stallPingTs": 1780585504.292032
     },
     "5bbdc9988a6f": {
       "id": "5bbdc9988a6f",
@@ -157,11 +158,12 @@
       "lastStatus": "Prod almanac.plow.co confirmed untouched + unlinked (0% our concern). Path chosen: Vercel + Upstash Redis (NOT Supabase - app is Redis/KV, not Postgres). Isolated proof project almanac-seed-proof created. Upstash being connected via CLI (no CEO click). Next: engineer wires passphrase-auth INTO the seed, deploy, prove public URL+external reachability+real persistence, fold deploy recipe into seed, blind-seed run. Target: ANYONE reproduces their own Almanac from the seed.",
       "proofs": [],
       "subs": [],
-      "pingsToBoss": 1,
+      "pingsToBoss": 4,
       "assignedAt": 1780580813632,
       "lastStopTs": null,
       "created": 1780580699137,
-      "updated": 1780583136476
+      "updated": 1780585805433,
+      "stallPingTs": 1780585805.430007
     },
     "b093eb11f71c": {
       "id": "b093eb11f71c",

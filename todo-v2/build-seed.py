@@ -58,6 +58,10 @@ before `ready`; `done` rejected unless `verified`.
   Then it pings the Boss to re-engage/reassign. Unknown agent (no status file) → pinged (err toward
   nudging). This is what actually catches a parked engineer, since real engineers never POST
   `/hook/stop` (so (b) rarely fires on its own).
+- **`blocked` is exempt** — machines (a) and (c) both skip `blocked` cards. When an engineer's
+  actionable work is done but the card is gated on a CEO window/decision, it signals
+  `POST /todo/status {{id, ceoGated:true, lastStatus:"…"}}` → the card moves to `blocked` (still
+  **not done**), so the Boss isn't false-nagged while it honestly waits on the human.
 
 ---
 
@@ -155,6 +159,14 @@ curl -fs -H 'Content-Type: application/json' -d "{{\\"op\\":\\"set\\",\\"id\\":\
 sleep 4
 grep -q WATCHDOG /tmp/tv2-wd-board/boss-inbox.log || {{ echo "FAIL: watchdog did not ping for a stalled assignee"; exit 1; }}
 [ "$(curl -fs $WH/todo/board | J "['tasks']['$WTID']['pingsToBoss']")" -gt 1 ] || {{ echo "FAIL: watchdog ping not incrementing"; exit 1; }}
+# done-pending-CEO -> blocked: even with a STALLED assignee, a ceoGated/blocked card must NOT be nagged
+WTID2=$(curl -fs -H 'Content-Type: application/json' -d '{{"op":"add","text":"WD-blocked"}}' $WH/todo/update | J "['id']")
+curl -fs -H 'Content-Type: application/json' -d "{{\\"op\\":\\"set\\",\\"id\\":\\"$WTID2\\",\\"doneCondition\\":\\"x\\"}}" $WH/todo/update >/dev/null
+curl -fs -H 'Content-Type: application/json' -d "{{\\"id\\":\\"$WTID2\\",\\"brainstorm\\":\\"b\\",\\"promote\\":\\"ready\\"}}" $WH/todo/brainstorm >/dev/null
+curl -fs -H 'Content-Type: application/json' -d "{{\\"op\\":\\"set\\",\\"id\\":\\"$WTID2\\",\\"workToDone\\":true,\\"assignee\\":\\"t/eng-stalled\\"}}" $WH/todo/update >/dev/null
+curl -fs -H 'Content-Type: application/json' -d "{{\\"id\\":\\"$WTID2\\",\\"ceoGated\\":true,\\"lastStatus\\":\\"done-pending-CEO\\"}}" $WH/todo/status | J "['state']" | grep -qx blocked || {{ echo "FAIL: ceoGated did not move card to blocked"; exit 1; }}
+sleep 4
+[ "$(grep -c "$WTID2.*WATCHDOG" /tmp/tv2-wd-board/boss-inbox.log)" -eq 0 ] || {{ echo "FAIL: watchdog nagged a blocked (ceoGated) card"; exit 1; }}
 
 pkill -f todo-v2-server.py 2>/dev/null || true
 echo "VERIFY_OK: todo-v2 — board drives Boss dispatch, ping machine (cron-unassigned + idle-post-stophook + assigned-idle WATCHDOG -> Boss), proof-gated verify, re-ping. SEED one-shot in a clean container."
