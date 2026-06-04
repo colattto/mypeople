@@ -52,12 +52,16 @@ before `ready`; `done` rejected unless `verified`.
 - **(b) assigned task** → `IDLE_GRACE_SEC` (prod **60s**) after that engineer's Stop hook, if still
   idle → ping the Boss. Toggling ON also enqueues a Boss message immediately.
 - **(c) assigned-but-idle WATCHDOG** → every `WATCHDOG_SEC` (60s) the server checks each
-  working+assigned card's engineer via its mypeople `status.json` (last-Stop time) **+** its Claude
-  session transcript mtime. Stalled := stopped > `IDLE_STALL_SEC` (prod **300s = 5 min**) ago AND no
-  transcript activity in that window (a long *silent* render still reads as busy → no false stall).
+  working+assigned card's engineer via THREE signals: mypeople `status.json` (last-Stop time),
+  the Claude session transcript mtime, AND the engineer's **process tree** (`tmux` pane pid → child
+  procs). Stalled := stopped > `IDLE_STALL_SEC` (prod **300s = 5 min**) ago AND no transcript
+  activity AND **no active job in the process tree** — where "active job" = a heavy child by name
+  (ffmpeg/docker/git/build tools — the CLI client stays a pane child for the whole job) OR CPU burn
+  **excluding the persistent MCP/browser stack**. So a 20-min silent ffmpeg render or docker build is
+  NOT a false stall, but a genuinely-parked agent (only its shell, nothing running) still is.
   Then it pings the Boss to re-engage/reassign. Unknown agent (no status file) → pinged (err toward
   nudging). This is what actually catches a parked engineer, since real engineers never POST
-  `/hook/stop` (so (b) rarely fires on its own).
+  `/hook/stop` (so (b) rarely fires on its own). `BUSY_CPU_PCT` / `BUSY_NAMES` tune the job check.
 - **`blocked` is exempt** — machines (a) and (c) both skip `blocked` cards. When an engineer's
   actionable work is done but the card is gated on a CEO window/decision, it signals
   `POST /todo/status {{id, ceoGated:true, lastStatus:"…"}}` → the card moves to `blocked` (still

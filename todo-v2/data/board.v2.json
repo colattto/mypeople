@@ -117,16 +117,17 @@
       "brainstorm": "Durable, reboot-proof scheduler that posts one trial reel every 15 min from the TO-POST stock, idempotent (tracks posted-state, never double-posts), auto-detects NEW videos the editor adds to the folder, logs each post, and survives reboot (launchd timer, not an agent loop \u2014 that was the root cause it died). Editor workflow: drop video+caption into TO-POST, it auto-posts on the next slot. Owner: postiz:eng-1.",
       "workToDone": true,
       "assignee": "daniels-MacBook-Pro-2/postiz:eng-1",
-      "state": "working",
+      "state": "blocked",
       "verified": false,
-      "lastStatus": "LIVE. First reel published (instagram.com/reel/DZKmObAAaHv) via the durable launchd timer (not an agent loop = the prior root cause). Draining the 30-video backlog at 15-min intervals, idempotent. Pending CEO eyeball: confirm it posted as a TRIAL reel.",
+      "lastStatus": "VERIFIED draining. launchd timer com.plow.postiz-trial-reels: loaded+active, runs=7, last exit 0, interval 900s. 5 reels PUBLISHED to IG today, 0 errors: reel/DZKmObAAaHv, reel/DZKocKuCWet, reel/DZKqMNMHHBd, reel/DZKvbYigfd6, reel/DZKxMnGCsw6. Ledger tracks posted-state (no double-post; the 14 old May reels untouched). Folder now 26 videos (editor-curated from 30); runner lists live each tick + auto-adapts. Only remaining: CEO eyeball that it posts as a TRIAL reel.",
       "proofs": [],
       "subs": [],
-      "pingsToBoss": 1,
+      "pingsToBoss": 2,
       "assignedAt": 1780579274856,
       "lastStopTs": null,
       "created": 1780577565396,
-      "updated": 1780583136478
+      "updated": 1780586146584,
+      "stallPingTs": 0
     },
     "a939d3de63a3": {
       "id": "a939d3de63a3",
@@ -135,16 +136,17 @@
       "brainstorm": "Post the 2nd video (Dropbox folder) to YouTube via the established flow. Steps: inspect folder (video + title/description/metadata), confirm target YouTube channel + valid auth, STAGE the post, get CEO confirm on title/description/visibility (public YouTube = hard to reverse), then publish. Owner: postiz:eng-1 (already investigating + staging).",
       "workToDone": true,
       "assignee": "daniels-MacBook-Pro-2/postiz:eng-1",
-      "state": "working",
+      "state": "blocked",
       "verified": false,
-      "lastStatus": "STAGED, not published. Video=SF-trip vlog (dane-youtube-02-viagem-sf.mov ~653MB). BLOCKED ON CEO: pick title (3 options), thumbnail (3 options), visibility (public/unlisted). Channel+auth to confirm on publish.",
+      "lastStatus": "PUBLISHED \u2705 https://www.youtube.com/watch?v=AKU1AX6hPpI (Pr\u00f3xima Parada: S\u00e3o Francisco, public). CEO-gated cleanup: delete 2 duplicate copies (X0axLZRn8d8 + 1 private in Studio\u2192Content); 3 thumbnails in ~/Downloads for A/B test.",
       "proofs": [],
       "subs": [],
-      "pingsToBoss": 1,
+      "pingsToBoss": 2,
       "assignedAt": 1780578433216,
       "lastStopTs": null,
       "created": 1780578378181,
-      "updated": 1780583136478
+      "updated": 1780586059034,
+      "stallPingTs": 0
     },
     "decdb5094955": {
       "id": "decdb5094955",
@@ -163,7 +165,7 @@
       "lastStopTs": null,
       "created": 1780580699137,
       "updated": 1780585805433,
-      "stallPingTs": 1780585805.430007
+      "stallPingTs": 0
     },
     "b093eb11f71c": {
       "id": "b093eb11f71c",
@@ -177,11 +179,12 @@
       "lastStatus": "Boss-assigned to editor:eng-1: locating the existing A/B-cam editing flow, then auto sync+silence-removal+synchronized-segment extraction on C4819/C4765, HW-encoded output for CEO to watch.",
       "proofs": [],
       "subs": [],
-      "pingsToBoss": 3,
+      "pingsToBoss": 5,
       "assignedAt": 1780583275973,
       "lastStopTs": null,
       "created": 1780583217491,
-      "updated": 1780583275977
+      "updated": 1780586567151,
+      "stallPingTs": 1780586567.150552
     }
   }
 }

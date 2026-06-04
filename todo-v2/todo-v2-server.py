@@ -27,6 +27,10 @@ STALL_REPING= float(os.environ.get("STALL_REPING_SEC", "300")) # re-ping throttl
 WATCHDOG    = float(os.environ.get("WATCHDOG_SEC", "60"))      # watchdog scan interval
 STATUS_DIR  = Path(os.environ.get("STATUS_DIR", str(Path.home() / "mypeople" / "status")))
 PROJECTS_DIR= Path(os.environ.get("PROJECTS_DIR", str(Path.home() / ".claude" / "projects")))
+BUSY_CPU    = float(os.environ.get("BUSY_CPU_PCT", "20"))      # watchdog: process-tree CPU% above this == busy (long job)
+BUSY_NAMES  = set(n.strip() for n in os.environ.get("BUSY_NAMES",
+    "ffmpeg,docker,buildkitd,containerd,rsync,scp,wget,curl,git,make,cmake,ninja,cargo,rustc,"
+    "gcc,cc,clang,ld,collect2,tsc,webpack,vite,esbuild,rollup,next,vercel,bun,sox,whisper").split(",") if n.strip())
 TEST_SINK   = os.environ.get("TODO_TEST_SINK", "0") == "1"
 BOSS_AGENT  = os.environ.get("BOSS_AGENT", "main:Boss")
 HTML_PATH   = Path(os.environ.get("TODO_HTML", str(Path(__file__).resolve().parent / "todos.html")))
@@ -176,8 +180,69 @@ def _session_active_within(session_id, window):
     except Exception: pass
     return False
 
+# Process-level "is the engineer actually running a long job?" — covers the case where a long
+# bash/tool call (ffmpeg render, docker build, npm build) makes the transcript go quiet for minutes.
+def _proc_table():
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,comm="], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return {}
+    tab = {}
+    for ln in out.splitlines():
+        p = ln.split(None, 3)
+        if len(p) < 4: continue
+        try: tab[int(p[0])] = (int(p[1]), float(p[2]), os.path.basename(p[3].strip()))
+        except Exception: continue
+    return tab
+
+def _pane_pid(agent_id):
+    """tmux pane pid for agent host/session:tab -> tmux session 'mc-<session>', window '<tab>'."""
+    try: sess, tab = agent_id.split("/", 1)[1].split(":", 1)
+    except Exception: return None
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-s", "-t", "mc-" + sess, "-F", "#{window_name}\t#{pane_pid}"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0: return None
+        for ln in r.stdout.splitlines():
+            w, _, pp = ln.partition("\t")
+            if w == tab:
+                try: return int(pp)
+                except Exception: return None
+    except Exception: return None
+    return None
+
+def _ignored_for_cpu(comm):
+    # the persistent MCP/browser stack burns CPU regardless of whether the agent is working;
+    # it must NOT count as "busy", or a parked agent with an open browser would never be flagged.
+    c = comm.lower()
+    return any(k in c for k in ("chrome", "node", "caffeinate", "mcp", "9222", "google"))
+
+def agent_busy(agent_id):
+    """True if the assigned engineer has an ACTIVE long-running job in its process tree.
+    Two signals: (1) a heavy command by NAME (ffmpeg/docker/build tools — the docker/ffmpeg CLI
+    client stays a pane child for the whole job, MCP-immune); (2) CPU burn EXCLUDING the persistent
+    MCP/browser stack. Returns False if the pane can't be located (no tmux) -> transcript/timestamp decide."""
+    pp = _pane_pid(agent_id)
+    if not pp: return False
+    tab = _proc_table()
+    kids = {}
+    for pid, (ppid, _, _) in tab.items(): kids.setdefault(ppid, []).append(pid)
+    seen, stack = set(), [pp]
+    while stack:
+        x = stack.pop()
+        for c in kids.get(x, []):
+            if c not in seen: seen.add(c); stack.append(c)
+    nodes = [p for p in (seen | {pp}) if p in tab]
+    by_name = any(tab[p][2] in BUSY_NAMES for p in nodes)
+    cpu = sum(tab[p][1] for p in nodes if not _ignored_for_cpu(tab[p][2]))
+    busy = by_name or cpu >= BUSY_CPU
+    if os.environ.get("DEBUG_BUSY") == "1":
+        names = sorted({tab[p][2] for p in nodes})
+        print(f"[busy] {agent_id} pane={pp} cpu(excl-mcp)={cpu:.1f} by_name={by_name} -> {busy} :: {names}", flush=True)
+    return busy
+
 def assignee_idle_secs(agent_id):
-    """Idle seconds if the assigned agent looks parked/stalled, else None (active/grace)."""
+    """Idle seconds if the assigned agent looks parked/stalled, else None (active/grace/busy-job)."""
     d = _status_for(agent_id)
     if not d: return IDLE_STALL + 1                         # no status -> can't confirm active -> stalled
     if d.get("status") != "idle": return None              # explicitly busy
@@ -185,6 +250,7 @@ def assignee_idle_secs(agent_id):
     idle_for = (time.time() - t) if t else IDLE_STALL + 1
     if idle_for < IDLE_STALL: return None                  # recently stopped -> grace, may pick up next task
     if _session_active_within(d.get("session_id"), IDLE_STALL): return None  # transcript moving -> busy turn
+    if agent_busy(agent_id): return None                   # long-running job in its process tree -> busy
     return idle_for
 
 def watchdog_loop():
