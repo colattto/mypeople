@@ -62,6 +62,9 @@ before `ready`; `done` rejected unless `verified`.
   Then it pings the Boss to re-engage/reassign. Unknown agent (no status file) → pinged (err toward
   nudging). This is what actually catches a parked engineer, since real engineers never POST
   `/hook/stop` (so (b) rarely fires on its own). `BUSY_CPU_PCT` / `BUSY_NAMES` tune the job check.
+  **Respawn-aware:** idle-time is capped by the live session's age (the agent's `claude` process
+  age via `ps etime`), so a re-spawned agent reusing a name isn't judged by the dead session's
+  stale stop-timestamp (no "idle 1212m" false stall on a brand-new session).
 - **`blocked` is exempt** — machines (a) and (c) both skip `blocked` cards. When an engineer's
   actionable work is done but the card is gated on a CEO window/decision, it signals
   `POST /todo/status {{id, ceoGated:true, lastStatus:"…"}}` → the card moves to `blocked` (still

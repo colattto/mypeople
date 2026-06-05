@@ -183,6 +183,7 @@ def _session_active_within(session_id, window):
 # Process-level "is the engineer actually running a long job?" — covers the case where a long
 # bash/tool call (ffmpeg render, docker build, npm build) makes the transcript go quiet for minutes.
 def _proc_table():
+    # pid -> (ppid, pcpu, comm)
     try:
         out = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,comm="], capture_output=True, text=True, timeout=5).stdout
     except Exception:
@@ -194,6 +195,45 @@ def _proc_table():
         try: tab[int(p[0])] = (int(p[1]), float(p[2]), os.path.basename(p[3].strip()))
         except Exception: continue
     return tab
+
+def _etime_secs(pid):
+    # portable (macOS + Linux): elapsed seconds since `pid` started, from ps etime ([[DD-]HH:]MM:SS)
+    try:
+        out = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return None
+    if not out: return None
+    days = 0
+    if "-" in out:
+        d, out = out.split("-", 1)
+        try: days = int(d)
+        except Exception: return None
+    try: parts = [int(x) for x in out.split(":")]
+    except Exception: return None
+    if len(parts) == 3:   h, m, s = parts
+    elif len(parts) == 2: h, m, s = 0, parts[0], parts[1]
+    else: return None
+    return days * 86400 + h * 3600 + m * 60 + s
+
+def _descendants(pp, tab):
+    kids = {}
+    for pid, v in tab.items(): kids.setdefault(v[0], []).append(pid)
+    seen, stack = set(), [pp]
+    while stack:
+        x = stack.pop()
+        for c in kids.get(x, []):
+            if c not in seen: seen.add(c); stack.append(c)
+    return [p for p in (seen | {pp}) if p in tab]
+
+def _session_age(agent_id):
+    """Seconds since the agent's CURRENT live session started (its claude process age), so a
+    respawned agent reusing a name isn't judged by the dead session's stale stop-timestamp."""
+    pp = _pane_pid(agent_id)
+    if not pp: return None
+    tab = _proc_table()
+    claude_pids = [p for p in _descendants(pp, tab) if tab.get(p, (0, 0, ""))[2] == "claude"] if pp in tab else []
+    ages = [a for a in (_etime_secs(p) for p in (claude_pids or [pp])) if a is not None]
+    return min(ages) if ages else None              # youngest claude = current session; else pane shell age
 
 def _pane_pid(agent_id):
     """tmux pane pid for agent host/session:tab -> tmux session 'mc-<session>', window '<tab>'."""
@@ -225,14 +265,7 @@ def agent_busy(agent_id):
     pp = _pane_pid(agent_id)
     if not pp: return False
     tab = _proc_table()
-    kids = {}
-    for pid, (ppid, _, _) in tab.items(): kids.setdefault(ppid, []).append(pid)
-    seen, stack = set(), [pp]
-    while stack:
-        x = stack.pop()
-        for c in kids.get(x, []):
-            if c not in seen: seen.add(c); stack.append(c)
-    nodes = [p for p in (seen | {pp}) if p in tab]
+    nodes = _descendants(pp, tab)
     by_name = any(tab[p][2] in BUSY_NAMES for p in nodes)
     cpu = sum(tab[p][1] for p in nodes if not _ignored_for_cpu(tab[p][2]))
     busy = by_name or cpu >= BUSY_CPU
@@ -248,7 +281,9 @@ def assignee_idle_secs(agent_id):
     if d.get("status") != "idle": return None              # explicitly busy
     t = _iso_epoch(d.get("timestamp", ""))
     idle_for = (time.time() - t) if t else IDLE_STALL + 1
-    if idle_for < IDLE_STALL: return None                  # recently stopped -> grace, may pick up next task
+    age = _session_age(agent_id)                           # respawn-aware: a freshly re-spawned agent
+    if age is not None: idle_for = min(idle_for, age)      # can't have been idle longer than its live session exists
+    if idle_for < IDLE_STALL: return None                  # recently stopped/respawned -> grace
     if _session_active_within(d.get("session_id"), IDLE_STALL): return None  # transcript moving -> busy turn
     if agent_busy(agent_id): return None                   # long-running job in its process tree -> busy
     return idle_for
