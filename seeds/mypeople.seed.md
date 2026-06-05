@@ -22,6 +22,7 @@ Each independently verifiable from a fresh shell.
 - `ttyd` running with `tmux attach` so per-tab attach URLs work.
 - tailscaled running, node online on the tailnet, HUD + ttyd reachable on the tailscale IP.
 - **Liveness is heartbeat-based**: an agent whose host stops heartbeating (e.g. its container is removed) auto-drops from `/agents` and the HUD within `QUEUE_DEAD_AFTER` seconds — no zombie agents lingering as `alive` after `mp kill` times out on a dead host. The reaper also prunes the dead host from `/clients`.
+- **Registry survives a server restart**: the in-memory registry is rebuilt automatically — each queue-client owns a durable record of its agents (`run/agents.json`) and re-announces them every heartbeat, so after a queue-server restart (or a reaper false-prune) the HUD repopulates with the still-running agents within one heartbeat cycle, with no manual re-registration.
 
 **Boss role:**
 - `~/mypeople/boss-CLAUDE.md` is installed (the Boss's job description, inlined in this seed).
@@ -551,6 +552,15 @@ TTYD_PUBLIC_URL = os.environ.get("TTYD_PUBLIC_URL", "")  # browser-reachable tty
 INSTALL_DIR = os.environ.get("INSTALL_DIR", os.path.expanduser("~/mypeople"))
 PLUGIN_DIR = os.path.join(INSTALL_DIR, "plugins", "tmux-boss-hooks")
 
+# Durable local record of the agents THIS client manages. The central server's
+# registry is in-memory: a server restart — or a heartbeat gap that trips its
+# liveness reaper — drops every registration, and agents only register at spawn,
+# so the HUD goes empty while the agents are still running. This client owns the
+# list and RE-ANNOUNCES it on every heartbeat (see reannounce_agents), making the
+# server's agent set a self-healing projection of the live clients.
+AGENTS_FILE = os.path.join(INSTALL_DIR, "run", "agents.json")
+_agents_lock = threading.Lock()
+
 PASTE_START = "\x1b[200~"
 PASTE_END = "\x1b[201~"
 
@@ -579,11 +589,86 @@ def heartbeat_loop():
             post_json("/heartbeat", {"hostname": HOSTNAME, "attach_base": TTYD_PUBLIC_URL})
         except urllib.error.URLError as e:
             print(f"{time.strftime('%H:%M:%S')} heartbeat FAIL: {e}", file=sys.stderr, flush=True)
+        # Re-announce our agents so a restarted/empty server rebuilds the live
+        # set within one heartbeat cycle — no manual re-registration ever needed.
+        try:
+            reannounce_agents()
+        except Exception as e:
+            print(f"{time.strftime('%H:%M:%S')} reannounce FAIL: {e}", file=sys.stderr, flush=True)
         time.sleep(HEARTBEAT)
 
 
 def tmux_run(*args, timeout=5):
     return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _load_agents():
+    try:
+        with open(AGENTS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _save_agents(d):
+    os.makedirs(os.path.dirname(AGENTS_FILE), exist_ok=True)
+    tmp = AGENTS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, AGENTS_FILE)   # atomic
+
+
+def record_agent(aid, backend, boss_id, is_master=False):
+    """Persist an agent this client just spawned so we can re-announce it later."""
+    with _agents_lock:
+        d = _load_agents()
+        d[aid] = {"backend": backend, "boss_id": boss_id, "is_master": bool(is_master)}
+        _save_agents(d)
+
+
+def forget_agent(aid):
+    with _agents_lock:
+        d = _load_agents()
+        if d.pop(aid, None) is not None:
+            _save_agents(d)
+
+
+def _window_alive(aid):
+    """aid = host/session:tab — alive iff its tmux window still exists here."""
+    try:
+        rest = aid.split("/", 1)[1]
+        sess, tab = rest.split(":", 1)
+    except (IndexError, ValueError):
+        return False
+    r = tmux_run("list-windows", "-t", f"mc-{sess}", "-F", "#{window_name}")
+    return r.returncode == 0 and tab in r.stdout.split()
+
+
+def reannounce_agents():
+    """Re-register every agent this client manages whose tmux window is still
+    alive; forget the ones whose window is gone (per-agent self-cleanup). Called
+    each heartbeat so the server's registry self-heals after any restart/wipe."""
+    with _agents_lock:
+        d = _load_agents()
+    if not d:
+        return
+    gone = []
+    for aid, meta in d.items():
+        if not _window_alive(aid):
+            gone.append(aid)
+            continue
+        try:
+            post_json("/agents/register", {
+                "agent_id": aid, "backend": meta.get("backend", ""), "state": "alive",
+                "boss_id": meta.get("boss_id", ""), "is_master": meta.get("is_master", False)})
+        except urllib.error.URLError:
+            pass  # server unreachable → next heartbeat retries
+    if gone:
+        with _agents_lock:
+            d = _load_agents()
+            for aid in gone:
+                d.pop(aid, None)
+            _save_agents(d)
 
 
 def tmux_send_text(target, text):
@@ -667,6 +752,7 @@ def execute_spawn(task):
             # return success. Callers (e.g. a Boss orchestrating workers) may
             # legitimately spawn the same id twice if a worker disconnected
             # but its tmux window survived.
+            record_agent(aid, backend, boss_id, is_master)
             try:
                 post_json("/agents/register", {"agent_id": aid, "backend": backend, "state": "alive", "boss_id": boss_id, "is_master": is_master})
             except urllib.error.URLError as e:
@@ -731,6 +817,7 @@ def execute_spawn(task):
         if not ok:
             return False, f"onboarding send failed: {err}"
 
+    record_agent(aid, backend, boss_id, is_master)
     try:
         post_json("/agents/register", {"agent_id": aid, "backend": backend, "state": "alive", "boss_id": boss_id, "is_master": is_master})
     except urllib.error.URLError as e:
@@ -809,6 +896,7 @@ def execute_kill(task):
     mc_sess = f"mc-{sess}"
     target = f"{mc_sess}:{tab}"
     if tmux_run("has-session", "-t", mc_sess).returncode != 0:
+        forget_agent(aid)
         try:
             post_json("/agents/unregister", {"agent_id": aid})
         except urllib.error.URLError:
@@ -821,6 +909,7 @@ def execute_kill(task):
         r = tmux_run("kill-window", "-t", target)
     if r.returncode != 0:
         return False, r.stderr.strip()
+    forget_agent(aid)
     try:
         post_json("/agents/unregister", {"agent_id": aid})
     except urllib.error.URLError:
@@ -1717,6 +1806,31 @@ curl -fsS -o /dev/null -w 'HUD via TS IP: HTTP %{http_code}\n' "http://$TS_IP:99
 
 # ttyd reachable on tailscale IP
 curl -fsS -o /dev/null -w 'ttyd via TS IP: HTTP %{http_code}\n' "http://$TS_IP:7681/" | grep -q 200 || { echo "FAIL: ttyd not reachable on tailscale IP"; exit 1; }
+
+# --- registry SURVIVES a queue-server restart (durability) ---
+# The registry is in-memory and agents only register at spawn, so a server
+# restart used to empty the HUD while every agent kept running. The client
+# re-announces its agents each heartbeat, so the server must rebuild the live
+# set itself within a heartbeat cycle — no manual re-registration.
+QSECRET=$(grep ^QUEUE_SECRET= ~/.config/mypeople/queue.env | cut -d= -f2-)
+HB=$(grep ^QUEUE_HEARTBEAT= ~/.config/mypeople/queue.env | cut -d= -f2-); HB=${HB:-30}
+BEFORE=$(curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents | jq 'length')
+[ "$BEFORE" -ge 1 ] || { echo "FAIL: no agents registered before restart"; exit 1; }
+kill "$(cat $INSTALL_DIR/run/queue-server.pid)" 2>/dev/null
+for i in $(seq 1 20); do curl -fsS http://127.0.0.1:9900/health >/dev/null 2>&1 || break; sleep 0.1; done
+set -a; . ~/.config/mypeople/queue.env; set +a
+nohup python3 -u "$INSTALL_DIR/bin/queue-server.py" >> "$INSTALL_DIR/run/queue-server.log" 2>&1 &
+echo $! > "$INSTALL_DIR/run/queue-server.pid"
+for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9900/health >/dev/null 2>&1 && break; sleep 0.2; done
+EMPTY=$(curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents | jq 'length')
+REPOP=0
+for i in $(seq 1 $((HB*2+10))); do
+  N=$(curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents | jq 'length')
+  [ "$N" -ge "$BEFORE" ] && { REPOP=1; break; }
+  sleep 1
+done
+[ "$REPOP" = 1 ] || { echo "FAIL: registry did not repopulate after server restart (empty=$EMPTY, want>=$BEFORE)"; exit 1; }
+echo "durability OK: $BEFORE agents → restart (empty=$EMPTY) → re-announced back to >=$BEFORE within a heartbeat cycle"
 
 # Cleanup
 mp kill "main:worker-1" >/dev/null 2>&1 || true
