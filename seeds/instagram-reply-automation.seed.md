@@ -171,14 +171,25 @@ def _mp_reply(request, memory, timeout):
     if not agent:
         raise RuntimeError("MYPEOPLE_BRAIN_AGENT is required for mp brain mode")
     request_id = request["request_id"]
+    ev = (request.get("event") or "message").strip().lower()
+    # Per-event GUIDANCE for the live worker (not a canned reply — the worker still
+    # writes every word). message=answer the DM; comment=warm DM reply to a commenter;
+    # new_follower=short welcome/hook (there is no inbound message).
+    directive = {
+        "comment": "This person COMMENTED on the creator's post/reel. Reply as one warm human DM that acknowledges them and moves them toward access. If they ask for SEED/access/link, include seed_url verbatim.",
+        "new_follower": "This person JUST FOLLOWED the creator. There is NO message from them. Send one short, warm welcome that hooks them and invites them to reply SEED for access; include seed_url only if it fits naturally.",
+    }.get(ev, "This is a direct Instagram DM. Reply to their message. If they ask for SEED/access/link, include seed_url verbatim.")
     prompt = (
-        "PROTOCOL TEST / INSTAGRAM REPLY REQUEST.\n"
+        "INSTAGRAM ATTENDANT REQUEST.\n"
         "Do not inspect files. Do not run tools. Do not explain. Answer immediately.\n\n"
         f"{SYSTEM}\n\n"
+        f"event: {ev}\n"
+        f"context: {directive}\n"
         f"request_id: {request_id}\n"
         f"subscriber_id: {request.get('subscriber_id')}\n"
         f"ig_username: {request.get('ig_username') or ''}\n"
         f"first_name: {request.get('first_name') or ''}\n"
+        f"post_id: {request.get('post_id') or ''}\n"
         f"recent_memory: {memory.get('summary','')}\n"
         f"seed_url: {SEED_URL}\n"
         f"inbound_message: {request.get('message_text') or ''}\n\n"
@@ -219,7 +230,7 @@ TIMEOUT_FALLBACK = os.environ.get("IGRA_TIMEOUT_FALLBACK", "")
 _lock = threading.RLock()
 
 ID_KEYS = ("subscriber_id", "uid", "user_id", "id", "contact_id")
-TEXT_KEYS = ("message_text", "last_input_text", "last_text_input", "text", "message")
+TEXT_KEYS = ("message_text", "last_input_text", "last_text_input", "text", "message", "comment_text")
 NAME_KEYS = ("first_name", "name", "full_name", "ig_username", "instagram_username")
 
 
@@ -399,6 +410,11 @@ class Handler(BaseHTTPRequestHandler):
             "message_text": _first(d, TEXT_KEYS),
             "first_name": _first(d, NAME_KEYS),
             "ig_username": str(d.get("ig_username") or d.get("instagram_username") or ""),
+            # event type drives the live worker's action: message (DM) | comment | new_follower.
+            # Every event still routes to the worker; no per-event canned reply.
+            "event": (str(d.get("event") or "message").strip().lower() or "message"),
+            "post_id": str(d.get("post_id") or ""),
+            "comment_id": str(d.get("comment_id") or ""),
         }
         rid, dup = _record_request(req)
         if dup:
