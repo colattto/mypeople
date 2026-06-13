@@ -211,7 +211,7 @@ PY
 
 cat > "$IGRA_HOME/bin/instagram_reply_server.py" <<'PY'
 #!/usr/bin/env python3
-import hashlib, json, os, threading, time, uuid, urllib.request
+import hashlib, json, os, threading, time, uuid, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -290,8 +290,12 @@ def send_content(subscriber_id, text):
         headers={"content-type": "application/json", "Authorization": f"Bearer {MANYCHAT_TOKEN}"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"HTTP {e.code}: {body}")
 
 
 def _record_request(req):
@@ -407,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
         req = {
             "subscriber_id": subscriber_id,
             "page_id": str(d.get("page_id") or "manychat"),
-            "message_text": _first(d, TEXT_KEYS),
+            "message_text": ("" if (lambda t: t.startswith("{{") and t.endswith("}}"))(_first(d, TEXT_KEYS)) else _first(d, TEXT_KEYS)),
             "first_name": _first(d, NAME_KEYS),
             "ig_username": str(d.get("ig_username") or d.get("instagram_username") or ""),
             # event type drives the live worker's action: message (DM) | comment | new_follower.
