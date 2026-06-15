@@ -19,7 +19,9 @@ def post(path, body):
         headers={"Content-Type": "application/json", **({"X-Queue-Secret": SEC} if SEC else {})})
     return json.load(urllib.request.urlopen(req))
 def board():
-    return json.load(urllib.request.urlopen(f"http://{HOST}/todo/board"))
+    req = urllib.request.Request(f"http://{HOST}/todo/board",
+        headers={"X-Queue-Secret": SEC} if SEC else {})   # GET /todo/board is auth-gated on a secured runtime
+    return json.load(urllib.request.urlopen(req))
 
 def main():
     tid = sys.argv[1]; time.sleep(0.5)

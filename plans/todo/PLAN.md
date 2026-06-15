@@ -1,9 +1,9 @@
-# PLAN — TODO v2 ("Priorities") — the CEO's board as the Boss's source of truth
+# PLAN — TODO ("Priorities") — the CEO's board as the Boss's source of truth
 
 > Status: **DRAFT FOR CEO FINAL APPROVAL** — Rule 1 plan-gate. No code is written until the CEO
 > types "approved/go". This file is the plan + the drafted E2E `## Verify`. v1 (`stream-todos`,
 > static HTML + localStorage) stays as-is; v2 is a new, MyPeople-connected app.
-> **Deliverable is a SEED** (`seeds/todo-v2.seed.md`), validated mypeople-style (clean-container
+> **Deliverable is a SEED** (`seeds/todo.seed.md`), validated mypeople-style (clean-container
 > one-shot + passing `## Verify`) — not just code. See §9.
 
 ## 0. One-line
@@ -78,7 +78,7 @@ Tunables (default 60 s in production; lowered in `## Verify` to keep tests fast)
 store must be shared between the browser and the Boss, and the Boss must be able to read the HTML.
 
 **Recommended (idiomatic to mypeople — "sibling seed layers a feature on top"):** ship v2 as a
-sibling seed `seeds/todo-v2.seed.md`, pasted AFTER mypeople is installed, adding four pieces:
+sibling seed `seeds/todo.seed.md`, pasted AFTER mypeople is installed, adding four pieces:
 
 1. **Shared store** — `~/mypeople/todos/board.v2.json` (source of truth), proofs under
    `~/mypeople/todos/proofs/<task_id>/`. Single-writer-safe via the queue-server process (same
@@ -187,12 +187,12 @@ left, agents/HUD right. v2.0 ships the standalone `/todos` page; embedding is a 
 - `eng-todo-ui` — the v2 HTML page (fork v1 visuals; required done-condition field, gated
   work-to-done toggle, brainstorm display/edit, proof attach + render, live status).
 - `eng-boss-doctrine` — Rule 4 addendum (brainstorm gate + reconcile/verify loop).
-- `eng-seed-packager` — fold all of the above into `seeds/todo-v2.seed.md` and run the seed
+- `eng-seed-packager` — fold all of the above into `seeds/todo.seed.md` and run the seed
   validation loop (§9). Orchestrated by the Boss; each slice has its own Verify before merge.
 
 ## 9. Deliverable = a validated SEED (mypeople doctrine)
 
-The final artifact is **`seeds/todo-v2.seed.md`** — a single sibling seed that, pasted into a clean
+The final artifact is **`seeds/todo.seed.md`** — a single sibling seed that, pasted into a clean
 mypeople runtime, stands up the whole v2 (store + API + ping machine + UI + Rule 4) and **passes its
 own `## Verify`**. Per the mypeople handbook: *the seed is the artifact; the running system is the
 proof; a seed without a passing Verify from a brand-new container is a draft.* So v2 is "done" only
@@ -261,5 +261,5 @@ for i in $(seq 1 30); do curl -fs "http://$H/todo/board" | jq -e --arg t "$TID" 
 # 8. INVARIANTS: no done-without-verified; nothing dispatched before ready
 curl -fs "http://$H/todo/board" | jq -e '[.tasks[]|select(.state=="done" and .verified!=true)]|length==0'
 curl -fs "http://$H/todo/board" | jq -e '[.tasks[]|select((.state|test("dispatched|working")) and (.brainstorm==""))]|length==0'
-echo "VERIFY_OK: todo-v2 seed — brainstorm gate, toggle⇒Boss-msg, ping machine (cron 1m unassigned + idle-1m-post-stophook assigned, always to Boss), proof-gated verify. Validate by one-shotting the seed in a CLEAN mypeople container, then run this from docker exec."
+echo "VERIFY_OK: todo seed — brainstorm gate, toggle⇒Boss-msg, ping machine (cron 1m unassigned + idle-1m-post-stophook assigned, always to Boss), proof-gated verify. Validate by one-shotting the seed in a CLEAN mypeople container, then run this from docker exec."
 ```

@@ -36,7 +36,7 @@ SEED = f'''# SEED — TODO ("Priorities") · MyPeople sibling seed
   /todo/wa`, `POST /todo/update /todo/brainstorm /todo/proof /todo/status /todo/comment /todo/answer
   /todo/wa/test /todo/wa/drain /hook/stop`. Served at **:9900/todos**.
 - `bin/todos.html` — the board UI (live client; done-condition field, gated toggle, brainstorm,
-  live status; **filter + sort by status**; **watchable proof on the board** — mp4 proofs play
+  live status; **filter by status**; **watchable proof on the board** — mp4 proofs play
   inline via a `<video controls>` player served Range-aware from `/todo/proof/<tid>/<file>`, png
   screenshots shown inline). **Issue-style card view**: click a task (the ⤢ control, or the card
   body) to open a GitHub-issue-style modal with the FULL durable message history for that task —
@@ -45,7 +45,10 @@ SEED = f'''# SEED — TODO ("Priorities") · MyPeople sibling seed
   new activity live and has a CEO comment composer. **Unread/new-message indication**: the board
   shows a separate `new` count when non-CEO timeline events (engineer/AI comments, status/state
   events, or proofs) arrive after the CEO's last read/open of that card; opening the issue card
-  marks those events read in the CEO browser, independent of review/blocked/done state. Every engineer status
+  marks those events read in the CEO browser, independent of review/blocked/done state. The viewbar
+  **`unread only · N`** badge counts DISTINCT CARDS that have unread activity (one card with 40 new
+  comments counts as 1, not 40) — i.e. how many cards to look at, never the total message count.
+  Every engineer status
   update and state change is appended to the durable `comments[]` thread automatically (so the
   history survives, unlike `lastStatus` which is overwritten); the CEO/AI post free-text via
   `POST /todo/comment {{task_id, body, by}}`. **Click-the-linked-engineer → attach**: the assignee

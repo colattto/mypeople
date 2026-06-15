@@ -22,7 +22,9 @@ POOL  = [x for x in os.environ.get("ENGINEER_POOL", "main:eng-1").split(",") if 
 ESIM  = os.environ.get("ENGINEER_SIM", "")
 
 def board():
-    return json.load(urllib.request.urlopen(f"http://{HOST}/todo/board"))
+    req = urllib.request.Request(f"http://{HOST}/todo/board",
+        headers={"X-Queue-Secret": SEC} if SEC else {})   # GET /todo/board is auth-gated on a secured runtime
+    return json.load(urllib.request.urlopen(req))
 def post(path, body):
     req = urllib.request.Request(f"http://{HOST}{path}", data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", **({"X-Queue-Secret": SEC} if SEC else {})})
@@ -73,8 +75,10 @@ def main():
         elif st == "working" and t.get("proofs"):
             res = verify_condition(t.get("doneCondition", ""), t)
             if res is True:
-                post("/todo/status", {"id": tid, "verified": True, "state": "done"})
-                acted.append(f"verified+done {tid}")
+                # AI verifies the done-condition but can only move UP TO review (Rule 21: only the CEO
+                # marks done). The card waits in review for the CEO's one-click sign-off.
+                post("/todo/status", {"id": tid, "verified": True, "state": "review"})
+                acted.append(f"verified->review {tid} (awaiting CEO sign-off)")
             elif res is False:
                 post("/todo/status", {"id": tid, "state": "working",
                                       "lastStatus": "not ready because done-condition not satisfied by proof"})

@@ -226,15 +226,20 @@ def boss_ping(task_id, reason):
         t["pingsToBoss"] = t.get("pingsToBoss", 0) + 1
         t["updated"] = now()
         save(b)
-        msg = f"[todo] task {task_id} ({t.get('text','')!r}): {reason}. " \
-              f"state={t['state']} assignee={t['assignee']} lastStatus={t.get('lastStatus','')!r}"
+        # COMPACT envelope (≤~220 chars). Embedding the FULL card text here (~1500 chars) made the
+        # bracketed-paste land as a large stuck draft in the Boss's composer: when the Boss was mid-turn
+        # the delayed-Enter was absorbed and tmux_send_text's 8-retry recovery could not submit it, so
+        # the ping was a REAL non-delivery (rc=1 "composer still held a draft"). A short message submits/
+        # queues cleanly. The card id is the lookup key; the title's first line is enough context.
+        title = (t.get("text", "").splitlines()[0] if t.get("text") else "")[:80]
+        msg = f"[todo] task {task_id} \"{title}\": {reason}. state={t['state']} assignee={t['assignee']}"
     try:
         INBOX_LOG.parent.mkdir(parents=True, exist_ok=True)
         with INBOX_LOG.open("a") as f: f.write(f"{now()} {msg}\n")
     except Exception: pass
     if not TEST_SINK and shutil.which("mp"):
         try:
-            r = subprocess.run(["mp", "send", BOSS_AGENT, msg], capture_output=True, text=True, timeout=10)
+            r = subprocess.run(["mp", "send", BOSS_AGENT, msg], capture_output=True, text=True, timeout=30)
             with INBOX_LOG.open("a") as f:
                 f.write(f"{now()} MP_SEND -> {BOSS_AGENT} rc={r.returncode} :: {(r.stdout or r.stderr).strip()[:140]}\n")
         except Exception as e:
@@ -565,7 +570,7 @@ def _mp_send(agent, msg):
     except Exception: pass
     if not TEST_SINK and shutil.which("mp"):
         try:
-            r = subprocess.run(["mp", "send", agent, msg], capture_output=True, text=True, timeout=15)
+            r = subprocess.run(["mp", "send", agent, msg], capture_output=True, text=True, timeout=30)
             return r.returncode == 0
         except Exception: return False
     return False
@@ -616,8 +621,11 @@ def retire_on_done(prev_state, t):
 def apply_comment(d):
     """Append a comment to a task's thread (slice b) AND make it a two-way channel.
     CHAIN OF COMMAND: a CEO comment is relayed to the BOSS (who redirects to the right engineer) —
-    never CEO→engineer directly. Engineer/AI replies (by=<agent id>) just thread back into the card
-    for the CEO's visibility (a real two-way GitHub-issue conversation)."""
+    never CEO→engineer directly. Engineer/AI replies (by=<agent id>) thread back into the card for
+    the CEO's visibility (a real two-way GitHub-issue conversation) AND now ALSO ping the Boss, so
+    the Boss sees card activity in real time instead of supervising blind off mp reports. Guarded
+    against noise: the Boss's OWN comments are NOT relayed back to itself (no loop), and 'system'
+    auto-posts don't ping. CEO comments keep their existing chain-of-command relay (no double-ping)."""
     with _lock:
         b = load(); t = b["tasks"].get(d.get("task_id") or d.get("id"))
         if not t: return {"error": "no such task"}
@@ -640,12 +648,23 @@ def apply_comment(d):
         t["updated"] = now(); save(b)
         tid = t["id"]; title = (t.get("text") or "")[:70]; assignee = t.get("assignee"); body = c["body"]
     routed = None
+    where = f"assigned: {assignee}" if assignee else "UNASSIGNED — assign + relay"
     if is_ceo:                                           # relay to the Boss (outside the lock)
-        where = f"assigned: {assignee}" if assignee else "UNASSIGNED — assign + relay"
         kick = " [card kicked review→working — more work needed]" if kicked else ""
         sent = _mp_send(BOSS_AGENT, f"[CEO comment on card {tid} “{title}” ({where})]{kick}: {body}\n"
                                     f"→ chain of command: relay to the right engineer (do not expect the CEO to ping them directly).")
         routed = f"boss:{'sent' if sent else 'logged'}"
+    else:
+        # Engineer/AI card-comment → ping the Boss for real-time visibility. Skip the Boss's OWN
+        # comments (the author's tab is 'Boss', or it equals BOSS_AGENT, or the body is a [BOSS] note)
+        # so we never loop a Boss post back to itself; skip 'system' auto-posts (auto-retire, etc.).
+        _by = str(by)
+        author_is_boss = (_by == BOSS_AGENT) or (_by.rsplit(":", 1)[-1] == "Boss") or body.lstrip().upper().startswith("[BOSS]")
+        if (not author_is_boss) and _by.lower() != "system":
+            snippet = body if len(body) <= 300 else body[:299] + "…"
+            sent = _mp_send(BOSS_AGENT, f"[card update on {tid} “{title}” by {_by} ({where})]: {snippet}\n"
+                                        f"→ engineer/AI posted this on the card (CEO can see it). Supervise — follow up if it needs action.")
+            routed = f"boss:{'sent' if sent else 'logged'}"
     wa_reconcile()                                       # if it left 'review', drop it from the CEO WhatsApp digest (slice e)
     return {"ok": True, "comment_id": c["id"], "routed": routed, "kicked": kicked}
 

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""todo-brainstorm — the brainstorm GATE generator (slice d).
+
+For every `needs_brainstorm` task that hasn't been brainstormed yet (brainstormAsked=False),
+ask a REAL brainstorm (headless `claude -p`, grounded in the YC office-hours method) to:
+  - decide whether the task is under-specified, and if so produce the clarifying QUESTIONS an
+    engineer would need answered before starting (returned to the CEO as questions IN THE CARD), and
+  - write a short brainstorm framing saved as the durable artifact.
+A task the brainstorm judges already-clear gets ZERO questions + a one-line framing → immediately
+promotable. The task stays `needs_brainstorm` and NON-workable until every question is answered.
+
+This is the real flow behind "create-task triggers the brainstorm flow" — no hardcoded questions.
+The Boss runs it on the needs_brainstorm ping (machine (a)), the same way it runs todo-reconcile.
+
+Env:
+  TODO_HOST     (127.0.0.1:9900)
+  QUEUE_SECRET  (sent on writes)
+  BRAINSTORM_CMD  generator argv; default 'claude -p' (reads the prompt on stdin, prints JSON).
+                  Set BRAINSTORM_CMD=stub for a deterministic offline generator (used by ## Verify).
+  BRAINSTORM_MODEL  optional model for claude (e.g. claude-haiku-4-5-20251001 — fast/cheap is fine).
+  ONLY_TASK     restrict to a single task id (default: all eligible).
+"""
+import os, re, json, sys, shlex, subprocess, urllib.request
+
+HOST = os.environ.get("TODO_HOST", "127.0.0.1:9900")
+SEC  = os.environ.get("QUEUE_SECRET", "")
+CMD  = os.environ.get("BRAINSTORM_CMD", "claude -p")
+MODEL= os.environ.get("BRAINSTORM_MODEL", "")
+ONLY = os.environ.get("ONLY_TASK", "")
+
+def board():
+    req = urllib.request.Request(f"http://{HOST}/todo/board",
+        headers={"X-Queue-Secret": SEC} if SEC else {})   # GET /todo/board is auth-gated on a secured runtime
+    return json.load(urllib.request.urlopen(req))
+def post(path, body):
+    req = urllib.request.Request(f"http://{HOST}{path}", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", **({"X-Queue-Secret": SEC} if SEC else {})})
+    return json.load(urllib.request.urlopen(req))
+
+PROMPT = """You are running YC-style office-hours on a single TODO task to GATE it before any \
+engineer starts. Trust nothing implicit. Decide if the task is under-specified to BUILD.
+
+TASK: {text}
+DONE-CONDITION: {cond}
+
+Return ONLY minified JSON (no prose, no code fence):
+{{"clear": <true|false>,
+  "brainstorm": "<2-4 sentence office-hours framing: the crux, the risk if we guess, the wedge>",
+  "questions": ["<the few clarifying questions whose answers an engineer MUST have to start; \
+each one specific and answerable in a sentence>"]}}
+
+Rules: if the task + done-condition are already specific enough to build, set "clear": true and \
+"questions": []. Otherwise list 1-5 questions — no filler, only blockers. Never invent answers."""
+
+def gen_stub(text, cond):
+    """Deterministic offline generator for ## Verify (no LLM). Mirrors the JSON contract."""
+    vague = re.search(r"\b(better|improve|nice|good|fast|clean|polish|some|stuff|etc)\b", (text or "").lower())
+    specific_cond = len((cond or "").strip()) >= 12
+    if not vague and specific_cond:
+        return {"clear": True, "brainstorm": f"Task is specific and has a checkable done-condition; safe to start: {text}", "questions": []}
+    return {"clear": False,
+            "brainstorm": f"'{text}' is under-specified — building on a guess risks rework. Pin the audience, the one primary outcome, and how we'll measure done.",
+            "questions": ["Who/what is this for, specifically?",
+                          "What is the single primary outcome that defines success?",
+                          "How will we verify it's done (a concrete, checkable signal)?"]}
+
+def gen_llm(text, cond):
+    prompt = PROMPT.format(text=text or "", cond=cond or "")
+    argv = shlex.split(CMD)
+    if MODEL and argv and os.path.basename(argv[0]).startswith("claude"):
+        argv += ["--model", MODEL]
+    out = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=180)
+    raw = (out.stdout or "").strip()
+    m = re.search(r"\{.*\}", raw, re.S)            # tolerate stray wrapping text
+    if not m: raise ValueError(f"generator returned no JSON: {raw[:200]!r}")
+    d = json.loads(m.group(0))
+    qs = [str(q).strip() for q in (d.get("questions") or []) if str(q).strip()]
+    if d.get("clear"): qs = []
+    return {"clear": bool(d.get("clear")), "brainstorm": str(d.get("brainstorm", "")).strip(), "questions": qs}
+
+def generate(text, cond):
+    return gen_stub(text, cond) if CMD.strip() == "stub" else gen_llm(text, cond)
+
+def main():
+    b = board(); acted = []
+    for tid, t in b["tasks"].items():
+        if ONLY and tid != ONLY: continue
+        if t.get("state") != "needs_brainstorm" or t.get("brainstormAsked"): continue
+        if t.get("questions"): continue                 # already has questions awaiting answers
+        try:
+            g = generate(t.get("text", ""), t.get("doneCondition", ""))
+        except Exception as e:
+            print(f"[brainstorm] {tid}: generator failed: {e}", file=sys.stderr); continue
+        post("/todo/brainstorm", {"id": tid, "questions": g["questions"], "brainstorm": g["brainstorm"], "by": "brainstorm"})
+        acted.append((tid, len(g["questions"]), "clear" if g["clear"] else "gated"))
+        print(f"[brainstorm] {tid}: {g['clear'] and 'CLEAR (0 q)' or str(len(g['questions']))+' question(s)'} — {t.get('text','')[:50]!r}")
+    if not acted: print("[brainstorm] nothing to brainstorm")
+
+if __name__ == "__main__":
+    main()
