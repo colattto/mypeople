@@ -103,6 +103,30 @@ Stop with `BLOCKED_REASON=<tool>_install_failed` if any of `tmux jq ttyd tailsca
 
 On **Linux only**, also verify `[ -c /dev/net/tun ]`. If missing, you're in a sandboxed container without the right permissions — stop with `BLOCKED_REASON=no_tun_device` (caller fixes by re-creating the container with `--device /dev/net/tun --cap-add NET_ADMIN`). On macOS the TUN check is N/A. **JOIN-mode exception**: if `UPSTREAM_QUEUE_URL` is already reachable (`curl -fsS "$UPSTREAM_QUEUE_URL/health"` returns 200), this node will NOT bring up Tailscale, so the TUN check is N/A — skip it.
 
+**Deterministic install (paste-and-run).** The prose above is the intent; this block makes a clean container actually install everything so the one-shot needs no human to "pick the command". Idempotent (installs only what's missing) and portable (apt/brew/dnf). `ttyd` is frequently absent from distro repos, so on Debian/Ubuntu it falls back to the static GitHub binary (x86_64/aarch64). A clean container that lacked `ttyd` made Step 9 fail `ttyd_failed_to_bind` — this is the root-cause fix.
+
+```bash
+need(){ command -v "$1" >/dev/null 2>&1; }
+if command -v apt-get >/dev/null 2>&1; then
+  sudo apt-get update -qq 2>/dev/null || true
+  sudo apt-get install -y -qq tmux python3 jq procps curl ca-certificates >/dev/null 2>&1 || true
+  if ! need ttyd; then
+    case "$(uname -m)" in aarch64|arm64) TA=ttyd.aarch64;; *) TA=ttyd.x86_64;; esac
+    sudo curl -fsSL -o /usr/local/bin/ttyd "https://github.com/tsl0922/ttyd/releases/latest/download/$TA" 2>/dev/null && sudo chmod +x /usr/local/bin/ttyd
+  fi
+elif command -v brew >/dev/null 2>&1; then
+  for p in tmux jq ttyd; do brew list "$p" >/dev/null 2>&1 || brew install "$p" || true; done
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y tmux jq procps-ng ttyd curl >/dev/null 2>&1 || true
+fi
+# tailscale — needed for self-contained tailnet identity; skip in JOIN mode when the upstream is already reachable.
+if [ -z "${UPSTREAM_QUEUE_URL:-}" ] || ! curl -fsS "${UPSTREAM_QUEUE_URL:-http://255.255.255.255:1}/health" >/dev/null 2>&1; then
+  need tailscale || { curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null 2>&1 || true; }
+fi
+for t in tmux jq ttyd python3 curl; do need "$t" || { echo "BLOCKED_REASON=${t}_install_failed"; exit 1; }; done
+echo "OS deps OK: tmux jq ttyd python3 curl$(need tailscale && printf ' tailscale')"
+```
+
 **Also ensure `claude` is new enough to support `--plugin-dir`** (the spawn path passes it; an older claude rejects it and every spawn fails with a misleading banner-timeout — surfaced live on a Raspberry Pi whose pre-installed claude was 2.0.5). `--plugin-dir` landed in claude **2.1.x**. Detect + upgrade:
 
 ```bash
@@ -2192,6 +2216,36 @@ if ! grep -q 'HOME/.local/bin' "$HOME/.bashrc" 2>/dev/null; then
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
 fi
 export PATH="$HOME/.local/bin:$PATH"
+```
+
+### 10.5. Spawn the Boss — bring the agent loop to life [self-contained]
+
+The CEO done-condition requires the one-shot to yield a **live Boss loop** (not just
+the daemons). A self-contained node spawns its OWN master Boss here so a fresh paste
+ends with `main:Boss [alive]` and onboarded (it read `boss-CLAUDE.md`, incl. the TODO
+rule from Step 9.5). JOIN nodes SKIP this — their Boss is the upstream's central Boss
+(`mp spawn <node>/... --boss <upstream>/main:Boss` from the upstream side). Idempotent:
+re-running won't double-spawn a live Boss.
+
+```bash
+if [ -z "${UPSTREAM_QUEUE_URL:-}" ]; then          # [self-contained only]
+  export PATH="$HOME/.local/bin:$PATH"
+  set -a; . "$HOME/.config/mypeople/queue.env"; set +a
+  H="${HOST_ID:-$(hostname)}"
+  if ! mp status 2>/dev/null | grep -q "$H/main:Boss \[alive\]"; then
+    mp spawn "$H/main:Boss" --master --backend claude || { echo "BLOCKED_REASON=boss_spawn_failed"; exit 1; }
+  fi
+  # Wait for the Boss's onboarding turn to land: status idle + a summary carrying >=2
+  # doctrine keywords (proves it actually read boss-CLAUDE.md, not just that a tab exists).
+  ok=0
+  for i in $(seq 1 60); do
+    f="$INSTALL_DIR/status/mc-main/Boss.json"
+    if [ -f "$f" ] && python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));s=(d.get("summary") or "").lower();sys.exit(0 if d.get("status")=="idle" and sum(w in s for w in ["plan","approve","queue","mp","fire-and-forget","autonomous"])>=2 else 1)' "$f" 2>/dev/null; then ok=1; break; fi
+    sleep 3
+  done
+  [ "$ok" = 1 ] && echo "Boss loop alive + onboarded: $(mp status 2>/dev/null | grep "$H/main:Boss" | head -1)" \
+                || echo "WARN: Boss spawned but onboarding summary not confirmed within 180s (check $INSTALL_DIR/status/mc-main/Boss.json)"
+fi
 ```
 
 ### 11. Sanity
