@@ -1,1 +1,26 @@
 .wiki-update-brief.md
+.gstack/
+
+# ManyChat prototype secrets
+prototypes/manychat-ig/.env
+
+# Tailscale node certs/keys — secrets, never commit
+*.crt
+*.key
+todo/data/auth/
+
+# Generated / ephemeral runtime data (board mutations, outbox queue, inbox log)
+*.bak-*
+*.bak
+todo/data/board.v2.json.bak-*
+todo/data/wa-outbox.json
+todo/data/boss-inbox.log
+.recovery/
+
+# Per-card proof + QA artifacts (heavy png/mp4/cast frames) — local evidence, not source
+todo/data/proofs/
+
+# OS / editor / python cruft
+.DS_Store
+__pycache__/
+*.pyc
