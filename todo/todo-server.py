@@ -112,6 +112,7 @@ def migrate_proofs(b):
     changed = False
     for tid, t in b.get("tasks", {}).items():
         for pr in t.get("proofs", []):
+            if not isinstance(pr, dict): continue   # tolerate legacy/malformed proof entries (e.g. a bare path string) — never let one crash the whole board GET
             if pr.get("type") in ("image", "video"):
                 ref = pr.get("ref", "")
                 if ref and not ref.startswith("/todo/proof/"):
@@ -458,18 +459,30 @@ def watchdog_loop():
         time.sleep(WATCHDOG)
         for tid in list(load().get("tasks", {}).keys()):
             ping = None
+            # (1) FAST snapshot under the lock: read ONLY the few fields we need, then RELEASE it.
             with _lock:
                 b = load(); t = b["tasks"].get(tid)
                 if not t or _is_test(t) or not (t.get("workToDone") and t.get("state") == "working" and t.get("assignee")):
                     continue          # test/demo fixtures never trigger the stall watchdog
-                idle = assignee_idle_secs(t["assignee"])
+                assignee = t["assignee"]
+            # (2) SLOW check OUTSIDE the lock. assignee_idle_secs() runs tmux capture-pane / ps / mp
+            #     subprocesses per agent — holding _lock across them serializes EVERY /todo/board read
+            #     behind the watchdog and empties the board (P0 deadlock). NEVER hold _lock during a
+            #     subprocess.run. The lock is reacquired below only to write stallPingTs + save.
+            idle = assignee_idle_secs(assignee)
+            # (3) reacquire the lock ONLY to record the result (fast: in-memory + save).
+            with _lock:
+                b = load(); t = b["tasks"].get(tid)
+                # re-validate against the live store (the card may have changed while the lock was free)
+                if not t or _is_test(t) or not (t.get("workToDone") and t.get("state") == "working" and t.get("assignee") == assignee):
+                    continue
                 if idle is None:
                     if t.get("stallPingTs"):                # agent recovered -> reset so next stall re-pings
                         t["stallPingTs"] = 0; save(b)
                     continue
                 if (time.time() - (t.get("stallPingTs") or 0)) >= STALL_REPING:
                     t["stallPingTs"] = time.time(); save(b)
-                    ping = (t["assignee"], int(idle // 60))
+                    ping = (assignee, int(idle // 60))
             if ping:
                 boss_ping(tid, f"WATCHDOG: assignee {ping[0]} IDLE/stalled ~{ping[1]}m at prompt "
                                f"(no activity) — re-engage or reassign")
