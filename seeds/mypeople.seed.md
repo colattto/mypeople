@@ -27,6 +27,7 @@ Each independently verifiable from a fresh shell.
 - tailscaled running, node online on the tailnet, HUD + ttyd reachable on the tailscale IP.
 - **Liveness is heartbeat-based**: an agent whose host stops heartbeating (e.g. its container is removed) auto-drops from `/agents` and the HUD within `QUEUE_DEAD_AFTER` seconds — no zombie agents lingering as `alive` after `mp kill` times out on a dead host. The reaper also prunes the dead host from `/clients`.
 - **Registry survives a server restart**: the in-memory registry is rebuilt automatically — each queue-client owns a durable record of its agents (`run/agents.json`) and re-announces them every heartbeat, so after a queue-server restart (or a reaper false-prune) the HUD repopulates with the still-running agents within one heartbeat cycle, with no manual re-registration.
+- **Retired engineers survive a reboot and can be REVIVED (true session resume)**: every spawned engineer is recorded in a durable roster (`run/roster.json`) with its exact spawn command and `cwd`; the `emit-event` hook persists its Claude **session-id** at SessionStart. `mp kill` (manual or the board's DONE→auto-retire) marks the engineer `retired` instead of forgetting it; on queue-client startup any roster engineer whose tmux window is gone (e.g. a reboot) is flagged `died-on-reboot`. The HUD's **"Retired engineers"** table lists each with its spawn command, why it retired, when, and its card (derived from the board by assignee). **Revive** (`mp revive <agent_id>` or the per-engineer HUD button — one at a time, NO restore-all) resumes the engineer's ACTUAL prior session via `claude --resume <session-id>`. Resume-by-session-id ONLY: if it can't resume (no session-id, or transcript gone) the HUD shows a hard error — there is **no** silent fresh-spawn fallback.
 
 **Boss role:**
 - `~/mypeople/boss-CLAUDE.md` is installed (the Boss's job description, inlined in this seed).
@@ -66,7 +67,8 @@ Each independently verifiable from a fresh shell.
 | `mp` CLI | inline | `spawn / send / peek / kill / status / answer` (peek classifies BUSY/IDLE; answer submits an AskUserQuestion form) |
 | `plugins/tmux-boss-hooks/` | inline | lifecycle hooks. Claude: `emit-event` on SessionStart / Stop / SessionEnd → status file + boss notification; PreToolUse/AskUserQuestion → `[AGENT QUESTION]`. Codex: `codex-notify` on `agent-turn-complete` → the SAME Stop-hook contract (status file + boss notification) |
 | `boss-CLAUDE.md` | inline | doctrine read by every Boss at spawn |
-| `dashboard.html` | inline | HUD page, served from queue-server, polls /agents + /clients |
+| `dashboard.html` | inline | HUD page, served from queue-server, polls /agents + /clients + /roster; live agents table PLUS a "Retired engineers" table with a per-engineer Revive button |
+| `run/roster.json` | runtime | durable roster of every engineer ever spawned (spawn cmd, cwd, session-id, state, retire reason) — backs the HUD's retired list and `mp revive` |
 | OS pkgs | apt: `tmux python3 jq procps ttyd tailscale` (with ttyd binary fallback) | |
 
 ## Steps
@@ -230,7 +232,8 @@ Available verbs:
 - `mp send <agent_id> "msg"` — queue a message.
 - `mp peek <agent_id>` — queued peek; response returns via the queue.
 - `mp status` — list agents.
-- `mp kill <agent_id>` — graceful exit.
+- `mp kill <agent_id> [--reason <killed|done-auto-retire>]` — graceful exit; the engineer is kept on the roster as `retired` so it can be revived.
+- `mp revive <agent_id>` — bring a retired engineer back by RESUMING its actual Claude session (`claude --resume <session-id>`). Resume-only: errors if the session can't be resumed (no fresh-spawn fallback). One engineer at a time; no batch restore.
 
 Fire-and-forget: every verb returns immediately. You wait for notifications; you don't poll. If you reach for raw tmux, stop — find the mp verb or flag a missing feature.
 
@@ -329,7 +332,7 @@ cat > "$INSTALL_DIR/bin/queue-server.py" <<'PY_EOF'
 #!/usr/bin/env python3
 """mypeople queue-server."""
 
-import http.server, json, os, sys, threading, time, uuid
+import glob, http.server, json, os, sys, threading, time, urllib.request, uuid
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
 
@@ -363,6 +366,58 @@ def _host_of(agent_id):
     if "/" in agent_id and ":" in agent_id:
         return agent_id.split("/", 1)[0]
     return ""
+
+
+TODO_URL = os.environ.get("QUEUE_TODO_URL", "http://127.0.0.1:9933")
+
+
+def _roster_session_id(install_dir, aid):
+    """Latest session-id for an engineer: roster (hook-written) first, then the
+    durable status file as fallback. Both survive reboot."""
+    sid = ""
+    try:
+        with open(os.path.join(install_dir, "run", "roster.json")) as f:
+            sid = (json.load(f).get(aid) or {}).get("session_id", "") or ""
+    except (FileNotFoundError, ValueError):
+        pass
+    if sid:
+        return sid
+    try:
+        host, rest = aid.split("/", 1); sess, tab = rest.split(":", 1)
+    except ValueError:
+        return ""
+    try:
+        with open(os.path.join(install_dir, "status", f"mc-{sess}", f"{tab}.json")) as f:
+            return (json.load(f) or {}).get("session_id", "") or ""
+    except (FileNotFoundError, ValueError):
+        return ""
+
+
+def _find_transcript(session_id):
+    """The Claude transcript file for a session-id, or None — globbed across all
+    project dirs (UUID is globally unique, so cwd→project-dir encoding is moot)."""
+    if not session_id:
+        return None
+    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def _board_assignee_cards():
+    """Best-effort {agent_id: {id,title}} from the todo board — DERIVES the
+    engineer→card link server-side (no CORS, no secret in the browser); the link
+    is never stored on the roster. Empty map if the board is unreachable."""
+    try:
+        req = urllib.request.Request(f"{TODO_URL}/todo/board", headers={"X-Queue-Secret": SECRET})
+        with urllib.request.urlopen(req, timeout=2) as r:
+            board = json.loads(r.read().decode())
+    except Exception:
+        return {}
+    out = {}
+    for tid, t in (board.get("tasks") or {}).items():
+        a = (t.get("assignee") or "").strip()
+        if a:
+            out[a] = {"id": tid, "title": (t.get("text") or "")[:70]}
+    return out
 
 
 def _agent_alive(v, now):
@@ -481,6 +536,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     item["tmux_target"] = f"{mc_sess}:{tab}"
                     items.append(item)
                 return self._json(200, items)
+        if p == "/roster":
+            # RETIRED engineers for the HUD: each with the exact spawn command, why
+            # it retired, when, its DERIVED card (from the board), and whether its
+            # session is resumable (session-id captured + transcript on disk). A
+            # non-resumable row is surfaced with resume_error — never silently
+            # masked, because revive is resume-by-session-id ONLY (no fresh spawn).
+            install_dir = os.environ.get("INSTALL_DIR", os.path.expanduser("~/mypeople"))
+            try:
+                with open(os.path.join(install_dir, "run", "roster.json")) as f:
+                    roster = json.load(f)
+            except (FileNotFoundError, ValueError):
+                roster = {}
+            cards = _board_assignee_cards()
+            out = []
+            for aid, e in roster.items():
+                if e.get("state") != "retired":
+                    continue
+                sid = _roster_session_id(install_dir, aid)
+                transcript = _find_transcript(sid)
+                if not sid:
+                    err = "no session-id captured for this engineer"
+                elif not transcript:
+                    err = f"session transcript {sid}.jsonl not found on disk"
+                else:
+                    err = ""
+                card = cards.get(aid, {})
+                out.append({
+                    "agent_id": aid, "backend": e.get("backend", ""), "cwd": e.get("cwd", ""),
+                    "boss_id": e.get("boss_id", ""), "spawn_cmd": e.get("spawn_cmd", ""),
+                    "retire_reason": e.get("retire_reason", ""), "retired_ts": e.get("retired_ts", ""),
+                    "spawned_ts": e.get("spawned_ts", ""), "session_id": sid,
+                    "resumable": bool(sid and transcript), "resume_error": err,
+                    "card_id": card.get("id", ""), "card_title": card.get("title", ""),
+                })
+            out.sort(key=lambda x: x.get("retired_ts", ""), reverse=True)
+            return self._json(200, out)
         if p == "/task/poll":
             qs = parse_qs(u.query)
             host = (qs.get("hostname", [""])[0]).strip()
@@ -547,7 +638,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if p == "/task/submit":
             action = data.get("action", "")
-            if action not in ("spawn", "send", "peek", "kill", "answer"):
+            if action not in ("spawn", "send", "peek", "kill", "answer", "revive"):
                 return self._json(400, {"error": f"unknown action {action!r}"})
             tid = uuid.uuid4().hex
             t = {
@@ -661,13 +752,8 @@ PASTE_END = "\x1b[201~"
 #   - "idle":   substrings proving an idle composer is present (prompt glyph, or
 #               a stable footer token). Claude "bypass permissions on"; Codex
 #               footer "<model> SEP <cwd>" where SEP is U+00B7 surrounded by spaces.
-#   - "region_end": footer substring bounding the BOTTOM of the composer region
-#               for draft detection. NOTE: _composer_draft also stops at the
-#               separator RULE ('────') just under the composer, which sits
-#               ABOVE this footer — stopping only at the footer used to swallow
-#               that rule line as fake "draft content" (every idle composer read
-#               as stuck). The rule is the real bottom edge; the footer is the
-#               backstop for backends that don't draw one.
+#   - "region_end": line substring bounding the BOTTOM of the composer region for
+#               paste-draft detection (the footer just under the composer).
 #   - "paste":  lowercased paste-draft tag a stuck multiline draft collapses to.
 MARKERS = {
     "claude": {
@@ -806,6 +892,122 @@ def forget_agent(aid):
         d = _load_agents()
         if d.pop(aid, None) is not None:
             _save_agents(d)
+
+
+# --- Durable ROSTER: every engineer ever spawned, kept across kill AND reboot ---
+# agents.json tracks only LIVE agents (and is pruned the moment a window dies).
+# The roster is the opposite: a permanent record so the HUD can list a RETIRED
+# engineer with the exact command to revive it (resume-by-session-id). The
+# engineer→card link is NOT stored here — it is derived from the board (the card
+# carries its assignee). session_id is written by the emit-event hook (authoritative)
+# and read-merge-preserved here so a python roster write never clobbers it.
+ROSTER_FILE = os.path.join(INSTALL_DIR, "run", "roster.json")
+_roster_lock = threading.Lock()
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _load_roster():
+    try:
+        with open(ROSTER_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _save_roster(d):
+    os.makedirs(os.path.dirname(ROSTER_FILE), exist_ok=True)
+    tmp = ROSTER_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, ROSTER_FILE)   # atomic
+
+
+def roster_record_spawn(aid, backend, cwd, boss_id, is_master, spawn_cmd):
+    """Persist/refresh a spawned engineer's revive metadata. Preserves any
+    session_id already written by the emit-event hook (merge, never clobber)."""
+    with _roster_lock:
+        d = _load_roster()
+        e = d.get(aid, {})
+        e.setdefault("session_id", "")
+        e.update({
+            "agent_id": aid, "backend": backend, "cwd": cwd,
+            "boss_id": boss_id, "is_master": bool(is_master),
+            "spawn_cmd": spawn_cmd, "state": "alive",
+            "retire_reason": "", "spawned_ts": _now_iso(), "retired_ts": "",
+        })
+        d[aid] = e
+        _save_roster(d)
+
+
+def roster_mark_retired(aid, reason):
+    """Flag an engineer retired (NOT deleted) so the HUD can offer a revive."""
+    with _roster_lock:
+        d = _load_roster()
+        e = d.get(aid)
+        if not e:
+            return
+        e["state"] = "retired"
+        e["retire_reason"] = reason
+        e["retired_ts"] = _now_iso()
+        _save_roster(d)
+
+
+def roster_mark_alive(aid):
+    with _roster_lock:
+        d = _load_roster()
+        e = d.get(aid)
+        if e:
+            e["state"] = "alive"
+            e["retire_reason"] = ""
+            e["retired_ts"] = ""
+            _save_roster(d)
+
+
+def detect_reboot_retirements():
+    """On client startup, any roster engineer still marked alive whose tmux window
+    is gone (the machine rebooted and killed every session) is retired with reason
+    'died-on-reboot' so the HUD lists it as revivable. No-op for windows still up."""
+    with _roster_lock:
+        d = _load_roster()
+    gone = [aid for aid, e in d.items()
+            if e.get("state") == "alive" and not _window_alive(aid)]
+    for aid in gone:
+        roster_mark_retired(aid, "died-on-reboot")
+    if gone:
+        print(f"reboot-detect: retired {len(gone)} engineer(s) whose window is gone: {gone}", flush=True)
+
+
+def _session_transcript(session_id):
+    """Path to the Claude transcript for a session-id, or None. Globs across all
+    project dirs (the session-id is a UUID → globally unique) so we don't depend on
+    the cwd→project-dir encoding."""
+    if not session_id:
+        return None
+    import glob
+    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def _roster_session_id(aid):
+    """Latest session-id for an engineer: roster (hook-written) first, then the
+    durable status file as fallback — both survive reboot."""
+    with _roster_lock:
+        sid = (_load_roster().get(aid) or {}).get("session_id", "") or ""
+    if sid:
+        return sid
+    parsed = parse_agent_id(aid)
+    if not parsed:
+        return ""
+    _, sess, tab = parsed
+    path = os.path.join(INSTALL_DIR, "status", f"mc-{sess}", f"{tab}.json")
+    try:
+        with open(path) as f:
+            return (json.load(f) or {}).get("session_id", "") or ""
+    except (FileNotFoundError, ValueError):
+        return ""
 
 
 def _window_alive(aid):
@@ -984,8 +1186,7 @@ def tmux_send_text(target, text, backend=DEFAULT_BACKEND):
     # merge/corrupt a queued message under contention. The wider 20×0.5s≈10s
     # budget + the busy-wait reserves the active key-recovery (BSpace+Enter) for a
     # genuinely absorbed Enter on an IDLE composer. A genuinely stuck draft still
-    # persists across the whole budget → still a loud, honest failure. (mp send +
-    # boss_ping mp timeouts were widened to 30s to cover the longer budget.)
+    # persists across the whole budget → still a loud, honest failure.
     ok = False
     empty_idle_seen = 0
     for attempt in range(20):
@@ -1032,6 +1233,33 @@ def parse_agent_id(aid):
     return host, sess, tab
 
 
+def claude_spawn_cmd(resume_sid=None):
+    """The claude launch command. With resume_sid it RESUMES that session by id
+    (--resume) — the revive path's only mechanism; without it, a fresh session.
+    Shared by execute_spawn and execute_revive so the two never drift."""
+    resume = f"--resume {shlex.quote(resume_sid)} " if resume_sid else ""
+    return (
+        f"claude {resume}--dangerously-skip-permissions "
+        f"--settings {shlex.quote(json.dumps({'skipDangerousModePermissionPrompt': True}))} "
+        f"--plugin-dir {shlex.quote(PLUGIN_DIR)}"
+    )
+
+
+def _env_exports(aid, mc_sess, tab, boss_id):
+    parts = [
+        f"export AGENT_NAME={shlex.quote(tab)}",
+        f"export AGENT_SESSION={shlex.quote(mc_sess)}",
+        f"export AGENT_ID={shlex.quote(aid)}",
+        f"export QUEUE_URL={shlex.quote(QUEUE_URL)}",
+        f"export QUEUE_SECRET={shlex.quote(SECRET)}",
+        f"export HOST_ID={shlex.quote(HOSTNAME)}",
+        f"export INSTALL_DIR={shlex.quote(INSTALL_DIR)}",
+    ]
+    if boss_id:
+        parts.append(f"export BOSS_ID={shlex.quote(boss_id)}")
+    return parts
+
+
 def execute_spawn(task):
     payload = task.get("payload", {})
     aid = payload.get("agent_id", "")
@@ -1074,6 +1302,7 @@ def execute_spawn(task):
                                f"refusing to relabel it as {backend!r} (that would make the "
                                f"registry lie). `mp kill {aid}` then re-spawn --backend {backend}.")
             record_agent(aid, backend, boss_id, is_master)
+            roster_record_spawn(aid, backend, cwd, boss_id, is_master, claude_spawn_cmd() if backend == "claude" else f"{backend} (backend)")
             try:
                 post_json("/agents/register", {"agent_id": aid, "backend": backend, "state": "alive", "boss_id": boss_id, "is_master": is_master})
             except urllib.error.URLError as e:
@@ -1084,11 +1313,7 @@ def execute_spawn(task):
             return False, f"new-window failed: {r.stderr.strip()}"
 
     if backend == "claude":
-        spawn_cmd = (
-            f"claude --dangerously-skip-permissions "
-            f"--settings {shlex.quote(json.dumps({'skipDangerousModePermissionPrompt': True}))} "
-            f"--plugin-dir {shlex.quote(PLUGIN_DIR)}"
-        )
+        spawn_cmd = claude_spawn_cmd()
     elif backend == "codex":
         # Codex's turn-end signal is its `notify` program (NOT a Stop hook).
         # Point it at the codex-notify shim per-spawn so no global ~/.codex
@@ -1106,17 +1331,7 @@ def execute_spawn(task):
     else:
         return False, f"backend {backend!r} not supported"
 
-    env_parts = [
-        f"export AGENT_NAME={shlex.quote(tab)}",
-        f"export AGENT_SESSION={shlex.quote(mc_sess)}",
-        f"export AGENT_ID={shlex.quote(aid)}",
-        f"export QUEUE_URL={shlex.quote(QUEUE_URL)}",
-        f"export QUEUE_SECRET={shlex.quote(SECRET)}",
-        f"export HOST_ID={shlex.quote(HOSTNAME)}",
-        f"export INSTALL_DIR={shlex.quote(INSTALL_DIR)}",
-    ]
-    if boss_id:
-        env_parts.append(f"export BOSS_ID={shlex.quote(boss_id)}")
+    env_parts = _env_exports(aid, mc_sess, tab, boss_id)
     # Env hygiene for codex: a stray AGENT_ROLE inherited from a parent shell
     # made the legacy codex hook mis-route notifications. mypeople doesn't set
     # AGENT_ROLE, so this is purely defensive (harmless no-op when unset).
@@ -1190,12 +1405,84 @@ def execute_spawn(task):
             return False, f"onboarding send failed: {err}"
 
     record_agent(aid, backend, boss_id, is_master)
+    roster_record_spawn(aid, backend, cwd, boss_id, is_master, spawn_cmd)
     try:
         post_json("/agents/register", {"agent_id": aid, "backend": backend, "state": "alive", "boss_id": boss_id, "is_master": is_master})
     except urllib.error.URLError as e:
         return False, f"register failed: {e}"
 
     return True, {"agent_id": aid, "tmux_target": target, "boss_id": boss_id, "is_master": is_master}
+
+
+def execute_revive(task):
+    """REVIVE a retired engineer by RESUMING its actual Claude session (--resume
+    <session-id>). RESUME-ONLY: there is NO fresh-spawn fallback. Every failed
+    precondition returns a loud error that the HUD surfaces — we never silently
+    start a brand-new session in place of the one the CEO asked to revive."""
+    aid = task.get("target_agent", "")
+    parsed = parse_agent_id(aid)
+    if not parsed:
+        return False, "bad target_agent"
+    _, sess, tab = parsed
+    with _roster_lock:
+        entry = _load_roster().get(aid)
+    if not entry:
+        return False, f"not resumable: no roster record for {aid}"
+    if entry.get("state") != "retired":
+        return False, f"not revivable: {aid} is not retired (state={entry.get('state')!r})"
+    backend = entry.get("backend", "claude")
+    if backend != "claude":
+        return False, f"not resumable: revive supports only the claude backend (got {backend!r})"
+    cwd = entry.get("cwd", "")
+    if not cwd or not os.path.isdir(cwd):
+        return False, f"not resumable: original cwd missing on this host ({cwd!r})"
+    session_id = _roster_session_id(aid)
+    if not session_id:
+        return False, "not resumable: no session-id captured for this engineer"
+    transcript = _session_transcript(session_id)
+    if not transcript:
+        return False, f"not resumable: session transcript {session_id}.jsonl not found on disk"
+
+    boss_id = entry.get("boss_id", "")
+    is_master = bool(entry.get("is_master", False))
+    mc_sess = f"mc-{sess}"
+    has_sess = tmux_run("has-session", "-t", mc_sess).returncode == 0
+    if not has_sess:
+        r = tmux_run("new-session", "-d", "-s", mc_sess, "-n", tab, "-c", cwd)
+        if r.returncode != 0:
+            return False, f"new-session failed: {r.stderr.strip()}"
+    else:
+        wins = tmux_run("list-windows", "-t", mc_sess, "-F", "#{window_name}").stdout.splitlines()
+        if tab in wins:
+            return False, f"window {mc_sess}:{tab} already exists — kill it before reviving"
+        r = tmux_run("new-window", "-t", mc_sess, "-n", tab, "-c", cwd)
+        if r.returncode != 0:
+            return False, f"new-window failed: {r.stderr.strip()}"
+
+    spawn_cmd = claude_spawn_cmd(resume_sid=session_id)
+    env_parts = _env_exports(aid, mc_sess, tab, boss_id)
+    shell_cmd = f"cd {shlex.quote(cwd)} && {' && '.join(env_parts)} && exec {spawn_cmd}"
+    target = f"{mc_sess}:{tab}"
+    ok, err = tmux_send_text(target, shell_cmd)
+    if not ok:
+        return False, f"resume-cmd send failed: {err}"
+
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        r = tmux_run("capture-pane", "-t", target, "-p")
+        if "bypass permissions on" in (r.stdout or ""):
+            break
+        time.sleep(0.5)
+    else:
+        return False, "claude TUI didn't show 'bypass permissions on' within 40s after --resume"
+
+    record_agent(aid, backend, boss_id, is_master)
+    roster_mark_alive(aid)
+    try:
+        post_json("/agents/register", {"agent_id": aid, "backend": backend, "state": "alive", "boss_id": boss_id, "is_master": is_master})
+    except urllib.error.URLError as e:
+        return False, f"register failed: {e}"
+    return True, {"agent_id": aid, "tmux_target": target, "resumed_session_id": session_id, "transcript": transcript}
 
 
 def execute_send(task):
@@ -1270,11 +1557,17 @@ def execute_kill(task):
     parsed = parse_agent_id(aid)
     if not parsed:
         return False, "bad target_agent"
+    # The retire REASON the HUD shows: "killed" for a manual `mp kill`, or
+    # "done-auto-retire" when the board's DONE→retire path kills the assignee
+    # (`mp kill <id> --reason done-auto-retire`). The roster keeps the record
+    # either way (retired, not deleted) so the engineer can be revived.
+    reason = (task.get("payload", {}) or {}).get("reason", "killed")
     _, sess, tab = parsed
     mc_sess = f"mc-{sess}"
     target = f"{mc_sess}:{tab}"
     if tmux_run("has-session", "-t", mc_sess).returncode != 0:
         forget_agent(aid)
+        roster_mark_retired(aid, reason)
         try:
             post_json("/agents/unregister", {"agent_id": aid})
         except urllib.error.URLError:
@@ -1288,6 +1581,7 @@ def execute_kill(task):
     if r.returncode != 0:
         return False, r.stderr.strip()
     forget_agent(aid)
+    roster_mark_retired(aid, reason)
     try:
         post_json("/agents/unregister", {"agent_id": aid})
     except urllib.error.URLError:
@@ -1348,7 +1642,7 @@ def execute_answer(task):
 
 
 HANDLERS = {"spawn": execute_spawn, "send": execute_send, "peek": execute_peek,
-            "kill": execute_kill, "answer": execute_answer}
+            "kill": execute_kill, "answer": execute_answer, "revive": execute_revive}
 
 
 def task_loop():
@@ -1390,6 +1684,7 @@ def main():
         print("FATAL: QUEUE_SECRET not set", file=sys.stderr)
         sys.exit(1)
     print(f"queue-client started, host={HOSTNAME}, heartbeat={HEARTBEAT}s, poll={POLL_INTERVAL}s", flush=True)
+    detect_reboot_retirements()   # roster engineers whose window died (e.g. reboot) → retired, revivable
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     task_loop()
 
@@ -1560,14 +1855,40 @@ def cmd_peek(cfg, args):
 
 def cmd_kill(cfg, args):
     if len(args) < 1:
-        print("Usage: mp kill <agent_id>", file=sys.stderr); sys.exit(2)
+        print("Usage: mp kill <agent_id> [--reason <killed|done-auto-retire>]", file=sys.stderr); sys.exit(2)
     aid = canonicalize_agent_id(args[0], cfg["HOST_ID"])
-    body = {"action": "kill", "target_agent": aid}
+    reason = "killed"
+    i = 1
+    while i < len(args):
+        if args[i] == "--reason" and i + 1 < len(args):
+            reason = args[i + 1]; i += 2
+        else:
+            i += 1
+    # The reason is recorded on the durable roster so the HUD can show WHY an
+    # engineer retired (manual kill vs DONE→auto-retire). The engineer is kept
+    # (retired, not deleted) so it can be revived by resuming its session.
+    body = {"action": "kill", "target_agent": aid, "payload": {"reason": reason}}
     t = submit_and_wait(cfg, body, timeout=10)
     if t["status"] == "done":
         print(f"Killed {aid}")
     else:
         print(f"Kill FAILED: {t.get('error', '?')}", file=sys.stderr); sys.exit(1)
+
+
+def cmd_revive(cfg, args):
+    if len(args) < 1:
+        print("Usage: mp revive <agent_id>", file=sys.stderr); sys.exit(2)
+    aid = canonicalize_agent_id(args[0], cfg["HOST_ID"])
+    # REVIVE = resume the engineer's ACTUAL prior Claude session by session-id.
+    # Resume-only: if the session can't be resumed the server returns an error
+    # (surfaced here + on the HUD) — there is NO fresh-spawn fallback.
+    body = {"action": "revive", "target_agent": aid}
+    t = submit_and_wait(cfg, body, timeout=60)
+    if t["status"] == "done":
+        r = t.get("result") or {}
+        print(f"Revived {aid} — resumed session {r.get('resumed_session_id', '?')}  [tmux={r.get('tmux_target', '?')}]")
+    else:
+        print(f"Revive FAILED: {t.get('error', '?')}", file=sys.stderr); sys.exit(1)
 
 
 def cmd_answer(cfg, args):
@@ -1589,7 +1910,7 @@ def cmd_answer(cfg, args):
         print(f"Answer FAILED: {t.get('error', '?')}", file=sys.stderr); sys.exit(1)
 
 
-COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "answer": cmd_answer}
+COMMANDS = {"status": cmd_status, "spawn": cmd_spawn, "send": cmd_send, "peek": cmd_peek, "kill": cmd_kill, "answer": cmd_answer, "revive": cmd_revive}
 
 
 def main():
@@ -1684,12 +2005,50 @@ SESS_PART="${REST%%:*}"
 TAB_PART="${REST#*:}"
 STATUS_DIR="$INSTALL_DIR/status/mc-$SESS_PART"
 
-# --- PreToolUse / AskUserQuestion: an agent calling AskUserQuestion is about to
-# BLOCK on an interactive question form. The tool payload carries the question +
-# the exact options, so detect it HERE (a question is a blocked turn, not a Stop
-# — the Stop hook never fires for it, which is why a question used to hang
-# silently). Notify the Boss with the question + numbered options + how to
-# answer, so the Boss can unblock the agent remotely with `mp answer`. ---
+# Persist the CURRENT session-id onto the durable roster so REVIVE can resume the
+# actual session (this hook is authoritative for session_id; the queue-client
+# merge-preserves it). Done on EVERY event so a fresh engineer's session-id is
+# captured within seconds of spawn (SessionStart), not only at first Stop.
+ROSTER="$INSTALL_DIR/run/roster.json"
+if [ -n "$SID" ] && command -v jq >/dev/null 2>&1; then
+  mkdir -p "$INSTALL_DIR/run"
+  RTMP="$(mktemp)" || RTMP=""
+  if [ -n "$RTMP" ]; then
+    if [ -f "$ROSTER" ]; then
+      jq --arg aid "$AGENT_ID" --arg sid "$SID" \
+         '.[$aid] = ((.[$aid] // {}) + {session_id:$sid, agent_id:$aid})' "$ROSTER" \
+         > "$RTMP" 2>/dev/null && mv "$RTMP" "$ROSTER" || rm -f "$RTMP"
+    else
+      jq -n --arg aid "$AGENT_ID" --arg sid "$SID" \
+         '{($aid): {session_id:$sid, agent_id:$aid}}' > "$RTMP" 2>/dev/null \
+         && mv "$RTMP" "$ROSTER" || rm -f "$RTMP"
+    fi
+  fi
+fi
+
+# SessionStart: also seed/refresh the status file with the session-id (the Stop
+# branch overwrites it later with a real summary). This guarantees a durable
+# session-id exists even for an engineer that has not hit a Stop yet.
+if [ "$EVENT" = "SessionStart" ]; then
+  mkdir -p "$STATUS_DIR"
+  SF="$STATUS_DIR/$TAB_PART.json"
+  if [ -f "$SF" ] && command -v jq >/dev/null 2>&1; then
+    STMP="$(mktemp)" && jq --arg sid "$SID" --arg ts "$TS" \
+      '.session_id=$sid | .timestamp=$ts' "$SF" > "$STMP" 2>/dev/null && mv "$STMP" "$SF" || rm -f "$STMP"
+  else
+    jq -n --arg agent "$TAB_PART" --arg session "mc-$SESS_PART" --arg ts "$TS" \
+          --arg sid "$SID" --arg aid "$AGENT_ID" --arg boss "${BOSS_ID:-}" \
+      '{agent:$agent, session:$session, status:"starting", timestamp:$ts, session_id:$sid, summary:"", agent_id:$aid, boss_id:$boss}' \
+      > "$STATUS_DIR/$TAB_PART.json" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+# --- PreToolUse: an agent calling AskUserQuestion is about to BLOCK on an
+# interactive question form. Detect it here (the tool payload carries the
+# question + the exact options), notify the Boss with both, and tell the Boss
+# how to answer. This closes the silent-hang gap: a question is a blocked turn,
+# not a normal stop, so the Stop hook never fires for it. ---
 if [ "$EVENT" = "PreToolUse" ]; then
   TOOL=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null || echo "")
   [ "$TOOL" != "AskUserQuestion" ] && exit 0
@@ -1706,7 +2065,7 @@ if [ "$EVENT" = "PreToolUse" ]; then
     | join("\n")' 2>/dev/null || echo "")
   [ -z "$QBLOCK" ] && QBLOCK="(could not parse question payload)"
 
-  # Record a blocked-state status file so peek / the HUD show "waiting on a
+  # Record a blocked-state status file so peek / the HUD reflect "waiting on a
   # question" instead of looking idle.
   mkdir -p "$STATUS_DIR"
   jq -n --arg agent "$TAB_PART" --arg session "mc-$SESS_PART" --arg ts "$TS" \
@@ -1737,9 +2096,6 @@ fi
 
 # --- Stop event handling ---
 
-# Truncate summary to 1000 chars, single-line. 200 was too tight — Boss
-# onboarding summaries got cut off mid-word at "autonomo", barely failing
-# the doctrine-keyword check in Verify.
 SUMMARY=$(echo "$LAST_MSG" | tr '\n' ' ' | cut -c1-1000)
 
 # Write status file
@@ -1900,6 +2256,13 @@ cat > "$INSTALL_DIR/bin/dashboard.html" <<'HTML_EOF'
   code { background: #f1f1f1; padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
   a { color: #1f6feb; text-decoration: none; font-weight: 600; }
   .summary { color: #444; }
+  h2 { margin: 28px 0 10px; font-size: 15px; color: #333; }
+  .cmd { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #333; white-space: pre-wrap; word-break: break-all; max-width: 360px; display: inline-block; }
+  .reason { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #8a5a00; font-weight: 600; }
+  button.revive { background: #1e6e2c; color: #fff; border: 0; border-radius: 4px; padding: 5px 12px; font-weight: 600; cursor: pointer; font-size: 12px; }
+  button.revive:hover { background: #18581f; }
+  .noresume { display: inline-block; background: #fce8e6; color: #a52a2a; border: 1px solid #f0b3ad; border-radius: 4px; padding: 4px 9px; font-size: 11px; font-weight: 600; }
+  .card-link { font-size: 11px; }
 </style></head>
 <body>
 <h1>mypeople — HUD</h1>
@@ -1908,11 +2271,44 @@ cat > "$INSTALL_DIR/bin/dashboard.html" <<'HTML_EOF'
   <thead><tr><th>agent_id</th><th>state</th><th>backend</th><th>boss</th><th>summary</th><th>attach</th></tr></thead>
   <tbody id="rows"></tbody>
 </table>
+
+<h2>Retired engineers — revive to resume their session</h2>
+<table>
+  <thead><tr><th>agent_id</th><th>spawn command</th><th>card</th><th>why retired</th><th>when</th><th>revive</th></tr></thead>
+  <tbody id="retired"></tbody>
+</table>
+
 <script>
 const SECRET = "__INJECT_SECRET__";
+function esc(s){ return (s||'').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
 async function getJson(path) {
   const r = await fetch(path, { headers: { 'X-Queue-Secret': SECRET } });
   return r.json();
+}
+// Revive ONE engineer (resume its session by id). One button = one agent — there is
+// deliberately NO restore-all control. The server resumes by session-id only; if it
+// can't, it returns an error we show inline (never a silent fresh spawn).
+async function revive(agentId, btn) {
+  btn.disabled = true; btn.textContent = 'reviving…';
+  try {
+    const r = await fetch('/task/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Queue-Secret': SECRET },
+      body: JSON.stringify({ action: 'revive', target_agent: agentId })
+    });
+    const sub = await r.json();
+    if (!sub.task_id) throw new Error(sub.error || 'submit failed');
+    // poll the task to completion so we can surface a resume error on the row
+    for (let i = 0; i < 70; i++) {
+      await new Promise(res => setTimeout(res, 1000));
+      const t = await getJson('/task/' + sub.task_id);
+      if (t.status === 'done') { btn.textContent = 'resumed ✓'; break; }
+      if (t.status === 'failed') { btn.outerHTML = '<span class="noresume">revive failed: ' + esc(t.error||'') + '</span>'; break; }
+    }
+  } catch (e) {
+    btn.outerHTML = '<span class="noresume">' + esc(e.message) + '</span>';
+  }
+  refresh();
 }
 async function refresh() {
   try {
@@ -1922,8 +2318,9 @@ async function refresh() {
     const localBase = `http://${location.hostname || '127.0.0.1'}:7681`;
     const rows = a.map(x => {
       const target = x.tmux_target || '';
-      // per-host attach: a cross-host/container node uses the ttyd base it
-      // advertises (its Tailscale addr); same-host falls back to localhost.
+      // Per-host attach: a cross-host/container agent uses the ttyd base its
+      // own queue-client reports (its Tailscale address). Same-host agents
+      // have no reported base → fall back to localhost:7681.
       const cl = clientMap[x.host];
       const base = (cl && cl.attach_base) ? cl.attach_base : localBase;
       const url = `${base}/?arg=-t&arg=${encodeURIComponent(target)}`;
@@ -1942,6 +2339,30 @@ async function refresh() {
     document.getElementById('ts').textContent = new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById('ts').textContent = 'ERROR: ' + e.message;
+  }
+  // Retired engineers — each with the exact spawn command + a per-engineer revive.
+  try {
+    const retired = await getJson('/roster');
+    const rrows = (retired || []).map(x => {
+      const when = (x.retired_ts || '').replace('T', ' ').replace('Z', '');
+      const card = x.card_id
+        ? `<code class="card-link">${esc(x.card_id)}</code>${x.card_title ? ' ' + esc(x.card_title) : ''}`
+        : '<span style="color:#aaa">—</span>';
+      const action = x.resumable
+        ? `<button class="revive" onclick="revive('${esc(x.agent_id)}', this)">Revive</button>`
+        : `<span class="noresume" title="${esc(x.resume_error)}">Not resumable — ${esc(x.resume_error)}</span>`;
+      return `<tr>
+        <td><code>${esc(x.agent_id)}</code></td>
+        <td><span class="cmd">${esc(x.spawn_cmd)}</span></td>
+        <td>${card}</td>
+        <td><span class="reason">${esc(x.retire_reason)}</span></td>
+        <td style="font-size:11px;color:#666">${esc(when)}</td>
+        <td>${action}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('retired').innerHTML = rrows || '<tr><td colspan=6 style="color:#888">No retired engineers.</td></tr>';
+  } catch (e) {
+    document.getElementById('retired').innerHTML = '<tr><td colspan=6 style="color:#a52a2a">roster error: ' + esc(e.message) + '</td></tr>';
   }
 }
 refresh();
@@ -2595,6 +3016,15 @@ for i in $(seq 1 $((HB*2+10))); do
 done
 [ "$REPOP" = 1 ] || { echo "FAIL: registry did not repopulate after server restart (empty=$EMPTY, want>=$BEFORE)"; exit 1; }
 echo "durability OK: $BEFORE agents → restart (empty=$EMPTY) → re-announced back to >=$BEFORE within a heartbeat cycle"
+
+# --- retired-engineer / revive plumbing (no Claude auth needed) ---
+# Full resume is exercised by the standalone revive E2E (needs an authed claude);
+# here we just prove the wiring shipped: the /roster endpoint answers with a JSON
+# array, the `mp revive` verb exists, and the HUD renders the Retired table.
+curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/roster | jq -e 'type=="array"' >/dev/null || { echo "FAIL: /roster did not return a JSON array"; exit 1; }
+mp revive 2>&1 | grep -q "Usage: mp revive" || { echo "FAIL: 'mp revive' verb not wired"; exit 1; }
+curl -fsS http://127.0.0.1:9900/dashboard | grep -q "Retired engineers" || { echo "FAIL: HUD missing the Retired engineers table"; exit 1; }
+echo "revive plumbing OK: /roster + mp revive + HUD Retired table present"
 
 # Cleanup
 mp kill "main:worker-1" >/dev/null 2>&1 || true
