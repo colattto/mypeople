@@ -151,13 +151,23 @@ A `claude update` / npm upgrade preserves the node's auth (`~/.claude/.credentia
 
 ```bash
 INSTALL_DIR="${INSTALL_DIR:-$HOME/mypeople}"
-for name in queue-client queue-server ttyd tailscaled; do
+# SELF-INSTALL HAZARD — do NOT stop queue-client or ttyd here (regression guard).
+# On a node that is ALREADY a running fleet member (e.g. a JOIN node a remote Boss is
+# driving THIS install through), the queue-client is the node's heartbeat AND the very
+# send/peek transport carrying the install, and ttyd is the live browser-attach. Killing
+# them at the START of a re-install makes the node go dark to whoever launched it for the
+# ENTIRE run — observed live: the node vanished from the central HUD the instant this Step
+# ran and the driver's `mp peek` timed out (the install "succeeded" but unobservable).
+# Neither carries durable state across a restart, and Step 9 RE-launches both with the new
+# code via a graceful in-place handoff (kill-by-pidfile immediately before relaunch — no
+# dark window, no duplicate client). So Step 2 stops ONLY the queue-server (its port must be
+# free for Step 9's re-launch and a stale old-code server must not linger) and a userland
+# tailscaled this install previously started.
+for name in queue-server; do
   pidfile="$INSTALL_DIR/run/$name.pid"
   [ -f "$pidfile" ] && { sudo kill "$(cat $pidfile)" 2>/dev/null || kill "$(cat $pidfile)" 2>/dev/null || true; }
 done
-pkill -f "$INSTALL_DIR/bin/queue-client.py" 2>/dev/null || true
 pkill -f "$INSTALL_DIR/bin/queue-server.py" 2>/dev/null || true
-pkill -f "ttyd -W -p" 2>/dev/null || true
 # DO NOT kill a system-managed tailscaled (macOS Tailscale.app, Linux systemd).
 # Only kill a userland tailscaled this install previously started.
 [ -f "$INSTALL_DIR/run/tailscaled.pid" ] && sudo kill "$(cat $INSTALL_DIR/run/tailscaled.pid)" 2>/dev/null || true
@@ -2475,6 +2485,13 @@ The mechanism varies by host:
   sudo tailscale --socket="$TS_STATE_DIR/tailscaled.sock" up \
     --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" \
     --ssh=false --accept-routes=false
+  # Symlink the DEFAULT tailscale socket -> our custom socket so the BARE `tailscale`
+  # CLI (no --socket) works — for the human, and for Verify's `tailscale status`
+  # (which queries the default socket, like systemd/macOS). WITHOUT this the default
+  # socket is empty and `tailscale status` reports the node OFFLINE even though it is
+  # online on the custom socket — the exact no-systemd Verify false-fail.
+  sudo mkdir -p /var/run/tailscale
+  sudo ln -sf "$TS_STATE_DIR/tailscaled.sock" /var/run/tailscale/tailscaled.sock
   ```
 
 `$TS_AUTHKEY` is required **in self-contained mode**. If unset there, stop with `BLOCKED_REASON=ts_authkey_not_set`. (In JOIN-mode it's only consulted via the **[JOIN] first** path above.)
@@ -2485,6 +2502,17 @@ The mechanism varies by host:
 
 ```bash
 set -a; . "$HOME/.config/mypeople/queue.env"; set +a
+
+# GRACEFUL HANDOFF (paired with Step 2, which intentionally leaves the prior
+# queue-client + ttyd RUNNING so a remote-driven install never severs its own
+# heartbeat/attach mid-run): stop them by pidfile NOW — immediately before we
+# relaunch them with the freshly-written code below. This is the only point they
+# go down, for a sub-second window, so there is no dark gap and no duplicate
+# client, and ttyd's port frees so it rebinds the same one it advertised.
+for _d in queue-client ttyd; do
+  _pf="$INSTALL_DIR/run/$_d.pid"
+  [ -f "$_pf" ] && { kill "$(cat "$_pf")" 2>/dev/null || true; }
+done
 
 # Determine the ttyd port and the tailnet-reachable attach URL BEFORE starting
 # the queue-client, so the client advertises a WORKING attach_base in its very
@@ -2666,6 +2694,39 @@ if [ -z "${UPSTREAM_QUEUE_URL:-}" ]; then          # [self-contained only]
   done
   [ "$ok" = 1 ] && echo "Boss loop alive + onboarded: $(mp status 2>/dev/null | grep "$H/main:Boss" | head -1)" \
                 || echo "WARN: Boss spawned but onboarding summary not confirmed within 180s (check $INSTALL_DIR/status/mc-main/Boss.json)"
+
+  # ── BOSS SUPERVISOR — keep exactly-one master Boss ALWAYS up (CEO directive) ──
+  # The done-condition is "a Boss visibly working in the HUD". A Boss can die
+  # (crash, an `mp kill`, a stray tmux teardown, a reboot) — leaving the HUD with
+  # no Boss = a silent regression. The supervisor is a tiny userland loop that, if
+  # the Boss tmux window is gone, AUTO-RESTARTS it with the known spawn command
+  # (`mp spawn <host>/main:Boss --master` — same as above; --master re-onboards it
+  # from boss-CLAUDE.md). No human, no "ask another Claude". tmux is the source of
+  # truth (the queue /agents is a projection); we key off the window's existence so
+  # a transient queue blip never triggers a spurious double-spawn. Idempotent: only
+  # spawns when the window is ACTUALLY absent. setsid so it outlives this shell;
+  # pid-tracked so a reinstall replaces (not duplicates) it.
+  cat > "$INSTALL_DIR/bin/boss-supervisor.sh" <<'BSH'
+#!/usr/bin/env bash
+set -a; . "$HOME/.config/mypeople/queue.env"; set +a
+export PATH="$HOME/.local/bin:$PATH"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/mypeople}"
+H="${HOST_ID:-$(hostname -s)}"
+INTERVAL="${BOSS_SUPERVISOR_INTERVAL:-15}"
+while true; do
+  if ! tmux has-session -t mc-main 2>/dev/null \
+     || ! tmux list-windows -t mc-main -F '#{window_name}' 2>/dev/null | grep -qx Boss; then
+    echo "$(date -u +%H:%M:%S) Boss window absent — respawning $H/main:Boss" >&2
+    "$INSTALL_DIR/bin/mp" spawn "$H/main:Boss" --master --backend claude >/dev/null 2>&1 || true
+  fi
+  sleep "$INTERVAL"
+done
+BSH
+  chmod +x "$INSTALL_DIR/bin/boss-supervisor.sh"
+  [ -f "$INSTALL_DIR/run/boss-supervisor.pid" ] && kill "$(cat "$INSTALL_DIR/run/boss-supervisor.pid")" 2>/dev/null || true
+  setsid bash "$INSTALL_DIR/bin/boss-supervisor.sh" > "$INSTALL_DIR/run/boss-supervisor.log" 2>&1 </dev/null &
+  echo $! > "$INSTALL_DIR/run/boss-supervisor.pid"
+  echo "Boss supervisor up (pid $(cat "$INSTALL_DIR/run/boss-supervisor.pid")): always-one-Boss, ${BOSS_SUPERVISOR_INTERVAL:-15}s check"
 fi
 ```
 
@@ -2940,6 +3001,11 @@ echo "$AGENTS_JSON" | jq -e '.[] | .tmux_target' >/dev/null || { echo "FAIL: /ag
   kill $TPID 2>/dev/null
   echo "$AGENTS" | jq -e '.[] | select(.agent_id=="livehost/main:w")' >/dev/null || { echo "FAIL: reaper killed a still-heartbeating agent"; exit 1; }
   echo "$AGENTS" | jq -e '.[] | select(.agent_id=="deadhost/main:w")' >/dev/null && { echo "FAIL: zombie agent on a dead host was NOT reaped"; exit 1; }
+  # SUCCESS path must end the subshell with exit 0: the deadhost check above is a
+  # `jq -e ... && {FAIL}`, and on success jq -e exits NON-ZERO (no match) — left as
+  # the subshell's last command it makes `( … ) || exit 1` FALSE-FAIL even though the
+  # reaper worked. This trailing echo resets the subshell's exit status to 0.
+  echo "reaper OK: livehost kept alive, deadhost pruned"
 ) || exit 1
 
 # ttyd alive on its port
@@ -2953,9 +3019,12 @@ curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${TTYD_PORT}/" | grep
 #    lands user in default session (sometimes creating a bogus session
 #    named "-t" from misparsed args)
 ps -ax -o command | grep -E 'ttyd.*-a.* tmux attach' | grep -qv grep || { echo "FAIL: ttyd not running with '-a ... tmux attach' — attach links would be ignored or land in a default session"; ps -ax -o command | grep ttyd | head -3; exit 1; }
-# ttyd MUST be running with disableLeaveAlert=true so the browser doesn't
-# fire its "are you sure you want to close this page?" prompt on tab close.
-ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert=true' | grep -qv grep || { echo "FAIL: ttyd not running with -t disableLeaveAlert=true — closing the HUD attach tab will prompt the user"; ps -ax -o command | grep ttyd | head -3; exit 1; }
+# ttyd MUST be running with disableLeaveAlert so the browser doesn't fire its
+# "are you sure you want to close this page?" prompt on tab close.
+# NB: ttyd 1.7.7 REWRITES its argv for ps (`-t key=value` shows as `key value`),
+# so grep for the bare option name — NOT `disableLeaveAlert=true`, which never
+# matches the running process and false-fails (see "## Failure modes / Notes").
+ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert' | grep -qv grep || { echo "FAIL: ttyd not running with disableLeaveAlert — closing the HUD attach tab will prompt the user"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 # End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
 curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
 
@@ -3027,8 +3096,56 @@ curl -fsS http://127.0.0.1:9900/dashboard | grep -q "Retired engineers" || { ech
 echo "revive plumbing OK: /roster + mp revive + HUD Retired table present"
 
 # Cleanup
+# ── CEO DONE-CONDITION GATE: a WORKING BOSS must be live in the HUD ──────────
+# The done-condition is "a Boss visibly working in the HUD" (the HUD /dashboard
+# renders /agents). ASSERT the INSTALLED master Boss (Step 10.5) is ALIVE in
+# /agents — do NOT spawn one here (spawning would MASK a Boss that failed to
+# persist) and do NOT kill it in cleanup below. A Verify that prints VERIFY_OK but
+# left no Boss in the HUD is a FALSE GREEN (regression guard: this Verify's own
+# cleanup used to `mp kill main:Boss`, deleting the very Boss the CEO opens to).
+curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents \
+  | jq -e --arg b "$HOST_ID/main:Boss" '[.[]|select(.agent_id==$b and (.state=="alive"))]|length>=1' >/dev/null \
+  || { echo "FAIL: no working Boss ($HOST_ID/main:Boss) alive in the HUD /agents — done-condition NOT met"; \
+       curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents | jq -c '.[]|{agent_id,state}' 2>/dev/null || true; exit 1; }
+echo "Boss-in-HUD OK: $HOST_ID/main:Boss alive in /agents (HUD shows a working Boss)"
+
+# ── CEO DONE-CONDITION GATE: the BOSS SUPERVISOR resurrects a killed Boss ─────
+# "Always 1 Boss up." Prove the supervisor (Step 10.5) auto-restarts the Boss with
+# NO human: the supervisor daemon must be alive, and KILLING the Boss must make it
+# reappear ALIVE in the HUD /agents on its own. (This is the robust fix for the
+# no-Boss-in-HUD false green — not just "don't kill it", but "resurrect it".)
+kill -0 "$(cat "$INSTALL_DIR/run/boss-supervisor.pid" 2>/dev/null)" 2>/dev/null \
+  || { echo "FAIL: Boss supervisor daemon is not running (run/boss-supervisor.pid)"; exit 1; }
+tmux kill-window -t mc-main:Boss 2>/dev/null || tmux kill-session -t mc-main 2>/dev/null || true
+BOSS_BACK=0
+for i in $(seq 1 30); do            # supervisor checks ~every 15s; allow respawn + onboarding
+  curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents 2>/dev/null \
+    | jq -e --arg b "$HOST_ID/main:Boss" '[.[]|select(.agent_id==$b and (.state=="alive"))]|length>=1' >/dev/null 2>&1 \
+    && { BOSS_BACK=1; break; }
+  sleep 5
+done
+[ "$BOSS_BACK" = 1 ] || { echo "FAIL: Boss supervisor did NOT resurrect the killed Boss into the HUD /agents"; exit 1; }
+echo "Boss-supervisor OK: killed the Boss, supervisor auto-respawned it back into the HUD /agents (no human)"
+
+# ── CEO DONE-CONDITION GATE: the TODO app serves AND add-task round-trips ─────
+# TODO app on :9933. Prove a task created through the API (POST /todo/update
+# {op:add}) is read back on /todo/board, then remove the test fixture.
+curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:9933/ | grep -q '^200$' \
+  || { echo "FAIL: TODO app not serving on :9933"; exit 1; }
+TODO_MARK="verify-addtask-$$"
+TODO_ID=$(curl -fsS -H "X-Queue-Secret: $QSECRET" -H 'Content-Type: application/json' \
+  -d "{\"op\":\"add\",\"text\":\"$TODO_MARK\",\"test\":true}" http://127.0.0.1:9933/todo/update | jq -r '.id // empty')
+[ -n "$TODO_ID" ] || { echo "FAIL: TODO add-task POST returned no id (add-task broken)"; exit 1; }
+curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9933/todo/board \
+  | jq -e --arg i "$TODO_ID" '.tasks[$i] != null' >/dev/null \
+  || { echo "FAIL: added task $TODO_ID not on /todo/board (add-task did not persist)"; exit 1; }
+curl -fsS -H "X-Queue-Secret: $QSECRET" -H 'Content-Type: application/json' \
+  -d "{\"op\":\"del\",\"id\":\"$TODO_ID\"}" http://127.0.0.1:9933/todo/update >/dev/null 2>&1 || true
+echo "TODO add-task OK: created+read-back task $TODO_ID on :9933 (test fixture removed)"
+
+# Cleanup — kill ONLY the ephemeral test workers spawned during Verify. NEVER kill
+# the master Boss: the CEO done-condition requires it to stay LIVE in the HUD.
 mp kill "main:worker-1" >/dev/null 2>&1 || true
-mp kill "main:Boss" >/dev/null 2>&1 || true
 
 echo "VERIFY_OK"
 ```
