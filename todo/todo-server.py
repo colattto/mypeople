@@ -613,7 +613,7 @@ def retire_on_done(prev_state, t):
     killed = False; detail = ""
     if not TEST_SINK and shutil.which("mp"):
         try:
-            r = subprocess.run(["mp", "kill", assignee], capture_output=True, text=True, timeout=15)
+            r = subprocess.run(["mp", "kill", assignee, "--reason", "done-auto-retire"], capture_output=True, text=True, timeout=15)
             killed = (r.returncode == 0)
             detail = (r.stdout or r.stderr or "").strip()[:160]
         except Exception as e:
