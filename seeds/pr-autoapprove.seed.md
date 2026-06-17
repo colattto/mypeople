@@ -12,6 +12,8 @@ This is a sibling of [`mypeople.seed.md`](mypeople.seed.md) — a separate layer
 
 After install: a `pr-autoapprove` daemon runs on this host, polls GitHub every N seconds for new events on `WATCHED_REPOS`, pushes each relevant event as an `mp send` task targeting the Boss, and auto-approves PRs where someone typed the approve-command in a comment.
 
+It also acts as a **SEED REVIEWER**: it discovers open-PR repos org-wide under `WATCHED_ORGS` (one rate-safe `gh search` call, throttled to `ORG_POLL_INTERVAL`), and when a comment **@-mentions us** (`SELF_USER`) on a repo under `SEED_REVIEW_PREFIXES`, it spawns `seed-reviewer.py` — a persona-seeded headless `claude` engineer in a tmp folder that clones the PR head, decides whether it's a SEED project, checks the **>=90% instructions / <=10% code** bar (almanac/teleprompter as the reference), and posts the verdict as a PR comment.
+
 ## Depends on
 
 - **mypeople** is installed and healthy on this host. The Boss agent (`<host>/main:Boss` by default) exists and is reachable via the queue. Step 0 Interview verifies with `mp status` showing the Boss alive.
@@ -21,8 +23,9 @@ If either is missing: `BLOCKED_REASON=mypeople_not_installed` or `BLOCKED_REASON
 
 ## Done
 
-- `~/mypeople/bin/gh-pr-watcher.py` exists and is executable.
-- `~/.config/mypeople/gh-pr-watcher.env` contains `WATCHED_REPOS`, `SELF_USER`, `APPROVE_COMMAND`, `POLL_INTERVAL`, `BOSS_TARGET`.
+- `~/mypeople/bin/gh-pr-watcher.py` and `~/mypeople/bin/seed-reviewer.py` exist and are executable.
+- `~/.config/mypeople/gh-pr-watcher.env` contains `WATCHED_REPOS`, `SELF_USER`, `APPROVE_COMMAND`, `POLL_INTERVAL`, `BOSS_TARGET` (and, for the seed reviewer, `WATCHED_ORGS`, `SEED_REVIEW_PREFIXES`, `ORG_POLL_INTERVAL`).
+- Seed reviewer smoke: a comment `@<SELF_USER>` on a PR in a `SEED_REVIEW_PREFIXES` repo → within `ORG_POLL_INTERVAL` + `claude` runtime, a verdict comment is posted on the PR (valid SEED / not-a-proper-seed / "I do not review PRs that are not SEED projects").
 - A `gh-pr-watcher` daemon process is alive (poll loop running), **supervised** so it survives sleep / reboot / network blips: a launchd LaunchAgent (`com.mypeople.gh-pr-watcher`) on macOS, or a systemd `--user` unit (`gh-pr-watcher.service`) on Linux, both with restart-on-exit. The supervisor — not a bare PID file — owns the process lifecycle.
 - State file `~/mypeople/run/gh-pr-watcher-state.json` exists; first run initializes seen-ids without spamming.
 - Smoke: comment `/<SELF_USER>-approve` on a tracked test PR → within `POLL_INTERVAL`+`gh latency` seconds:
@@ -40,6 +43,9 @@ If either is missing: `BLOCKED_REASON=mypeople_not_installed` or `BLOCKED_REASON
 | `POLL_INTERVAL` | no | `15` (seconds) | env file | "How often to poll GitHub. With the `?since=<ts>` delta-fetch, each poll is ~3 calls/repo, so 15s = ~240 polls/hr × 3 = well under the 5000/hr authed limit. Lower for tighter latency; raise if you watch many repos." |
 | `BOSS_TARGET` | no | `<host>/main:Boss` | env file | "Full agent_id of the Boss to notify. Default: this host's main:Boss." |
 | `IGNORED_USERS` | no | `corgea[bot]` | env file | "Comma-separated GH users to silence entirely (bots, self-reviews). Comments / reviews from these users never trigger notifications. Approve-commands from these users are still honored (intentional — a bot can post the marker after CI passes)." |
+| `WATCHED_ORGS` | no | (empty) | env file | "Comma-separated GH orgs (e.g. `plow-pbc`). Each cycle, open-PR repos in these orgs are discovered org-wide via one `gh search` call and folded into the watch set — so the Boss is notified of activity across ALL of an org's repos without listing each. Empty = static `WATCHED_REPOS` only." |
+| `SEED_REVIEW_PREFIXES` | no | (empty) | env file | "Comma-separated `owner/`-or-`owner/repo` prefixes (e.g. `plow-pbc/`). A comment that @-mentions `SELF_USER` on a PR in a matching repo spawns the seed reviewer. Empty = seed review disabled." |
+| `ORG_POLL_INTERVAL` | no | `120` (seconds) | env file | "How often org-discovered repos are re-polled. Slower than `POLL_INTERVAL` to stay under the rate limit; the per-repo `since` watermark means a longer gap just widens the delta window, so no events are missed." |
 | `gh` CLI authed | yes | host-provided | `gh auth status` reports `Logged in` | `BLOCKED_REASON=gh_not_authed` — run `gh auth login` first. |
 | mypeople healthy | yes | from prior seed | `mp status` lists the Boss alive | `BLOCKED_REASON=mypeople_not_installed` — install [`mypeople.seed.md`](mypeople.seed.md) first. |
 
@@ -47,7 +53,8 @@ If either is missing: `BLOCKED_REASON=mypeople_not_installed` or `BLOCKED_REASON
 
 | Component | Source | Notes |
 |---|---|---|
-| `gh-pr-watcher.py` | **inline in this seed** | polls GH, decides relevance, posts to queue, runs approve-command |
+| `gh-pr-watcher.py` | **inline in this seed** | polls GH (static repos + org-discovered), decides relevance, posts to queue, runs approve-command, spawns the seed reviewer on @-mention |
+| `seed-reviewer.py` | **inline in this seed** | persona-seeded headless `claude` engineer in a tmp folder: clones the PR head, judges seed-or-not + the 90/10 instructions/code bar, posts the verdict comment |
 | state file | `~/mypeople/run/gh-pr-watcher-state.json` | `last_polled_at` per repo (ISO 8601 UTC) drives delta-fetch via `?since=`; `seen_ids[]` dedupes the 5s overlap window |
 | event archive | `~/.gh-pr-watcher/inbox/*.json` | full payloads so Boss can read more than the message snippet |
 | `gh` CLI | host-provided | `gh api`, `gh pr view`, `gh pr review --approve` |
@@ -94,6 +101,9 @@ APPROVE_COMMAND="${APPROVE_COMMAND:-/${SELF_USER}-approve}"
 POLL_INTERVAL="${POLL_INTERVAL:-15}"
 BOSS_TARGET="${BOSS_TARGET:-$(hostname -s)/main:Boss}"
 IGNORED_USERS="${IGNORED_USERS:-corgea[bot]}"
+WATCHED_ORGS="${WATCHED_ORGS:-}"
+SEED_REVIEW_PREFIXES="${SEED_REVIEW_PREFIXES:-}"
+ORG_POLL_INTERVAL="${ORG_POLL_INTERVAL:-120}"
 cat > "$HOME/.config/mypeople/gh-pr-watcher.env" <<EOF
 WATCHED_REPOS=${WATCHED_REPOS}
 APPROVE_REPOS=${APPROVE_REPOS}
@@ -102,6 +112,9 @@ APPROVE_COMMAND=${APPROVE_COMMAND}
 POLL_INTERVAL=${POLL_INTERVAL}
 BOSS_TARGET=${BOSS_TARGET}
 IGNORED_USERS=${IGNORED_USERS}
+WATCHED_ORGS=${WATCHED_ORGS}
+SEED_REVIEW_PREFIXES=${SEED_REVIEW_PREFIXES}
+ORG_POLL_INTERVAL=${ORG_POLL_INTERVAL}
 EOF
 chmod 600 "$HOME/.config/mypeople/gh-pr-watcher.env"
 ```
@@ -158,6 +171,20 @@ APPROVE_COMMAND = CFG.get("APPROVE_COMMAND", f"/{SELF_USER}-approve")
 POLL_INTERVAL = int(CFG.get("POLL_INTERVAL", "15"))
 BOSS_TARGET = CFG.get("BOSS_TARGET", "")
 IGNORED_USERS = set(u.strip() for u in CFG.get("IGNORED_USERS", "").split(",") if u.strip())
+
+# Orgs whose open-PR repos are discovered org-wide and folded into the watch set
+# each cycle (one cheap `gh search` call), in addition to the static
+# WATCHED_REPOS. This is how "Boss notified of PR activity across ALL plow-pbc/*
+# repos" is satisfied without statically enumerating ~40 repos.
+WATCHED_ORGS = [o.strip() for o in CFG.get("WATCHED_ORGS", "").split(",") if o.strip()]
+# Repos under these prefixes get a SEED REVIEW spawned when a comment @-mentions
+# us (SELF_USER). The reviewer analyses the PR and posts a verdict.
+SEED_REVIEW_PREFIXES = [p.strip() for p in CFG.get("SEED_REVIEW_PREFIXES", "").split(",") if p.strip()]
+SEED_REVIEWER = CFG.get("SEED_REVIEWER", str(INSTALL_DIR / "bin" / "seed-reviewer.py"))
+# Org-discovered repos are polled on a slower cadence than the static repos to
+# stay well under GitHub's rate limit. The per-repo `since` watermark means a
+# longer gap just widens the delta window — no events are missed.
+ORG_POLL_INTERVAL = int(CFG.get("ORG_POLL_INTERVAL", "120"))
 
 QUEUE_URL = QC.get("QUEUE_URL", "http://127.0.0.1:9900")
 QUEUE_SECRET = QC.get("QUEUE_SECRET", "")
@@ -236,14 +263,15 @@ def push_to_boss(message: str) -> bool:
 
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"seen_ids": [], "last_polled_at": {}}
+        return {"seen_ids": [], "last_polled_at": {}, "last_org_poll": 0}
     try:
         d = json.loads(STATE_FILE.read_text())
         d.setdefault("seen_ids", [])
         d.setdefault("last_polled_at", {})
+        d.setdefault("last_org_poll", 0)
         return d
     except json.JSONDecodeError:
-        return {"seen_ids": [], "last_polled_at": {}}
+        return {"seen_ids": [], "last_polled_at": {}, "last_org_poll": 0}
 
 
 def save_state(state: dict) -> None:
@@ -284,6 +312,54 @@ def gh_api(path: str, paginate: bool = True) -> list | dict:
         return json.loads(out)
     except json.JSONDecodeError:
         return []
+
+
+def discover_org_repos(orgs: list[str]) -> list[str]:
+    """Return repos in the given orgs that currently have >=1 open PR, via a
+    single search call per org (rate-safe). Only repos with open PRs are polled,
+    so the per-cycle cost stays small even across a large org."""
+    repos: set[str] = set()
+    for org in orgs:
+        try:
+            r = subprocess.run(
+                ["gh", "search", "prs", "--owner", org, "--state", "open",
+                 "--limit", "200", "--json", "repository"],
+                capture_output=True, text=True, timeout=GH_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"  discover_org_repos({org}) failed: {e}", file=sys.stderr)
+            continue
+        if r.returncode != 0:
+            print(f"  discover_org_repos({org}) rc={r.returncode}: {r.stderr[:200]}", file=sys.stderr)
+            continue
+        try:
+            for item in json.loads(r.stdout or "[]"):
+                name = (item.get("repository") or {}).get("nameWithOwner", "")
+                if name:
+                    repos.add(name)
+        except json.JSONDecodeError:
+            pass
+    return sorted(repos)
+
+
+def is_seed_review_repo(repo: str) -> bool:
+    return any(repo.startswith(pfx) for pfx in SEED_REVIEW_PREFIXES)
+
+
+def launch_seed_review(event: dict) -> None:
+    """Spawn the seed-reviewer detached to analyse this PR and post a verdict."""
+    cmd = [sys.executable, SEED_REVIEWER,
+           "--repo", event["repo"], "--pr", str(event["pr"]),
+           "--trigger-comment-id", str(event["id"]),
+           "--trigger-user", event.get("user", "")]
+    log_path = INSTALL_DIR / "run" / "seed-reviewer.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(log_path, "a")
+        subprocess.Popen(cmd, stdout=f, stderr=f, stdin=subprocess.DEVNULL,
+                         start_new_session=True, env={**os.environ, "INSTALL_DIR": str(INSTALL_DIR)})
+        print(f"  → spawned seed-reviewer for {event['repo']}#{event['pr']} (trigger {event['id']})")
+    except OSError as e:
+        print(f"  ERROR spawning seed-reviewer: {e}", file=sys.stderr)
 
 
 def list_open_prs(repo: str) -> dict[int, dict]:
@@ -361,7 +437,14 @@ def poll_once(state: dict, dry_run: bool = False) -> None:
     last_polled = state["last_polled_at"]
     cycle_start = now_iso()
 
-    for repo in WATCHED_REPOS:
+    repos = list(WATCHED_REPOS)
+    if WATCHED_ORGS and (time.time() - state.get("last_org_poll", 0)) >= ORG_POLL_INTERVAL:
+        org_repos = discover_org_repos(WATCHED_ORGS)
+        state["last_org_poll"] = time.time()
+        print(f"org-discover {WATCHED_ORGS}: {len(org_repos)} repo(s) with open PRs")
+        repos += org_repos
+    repos = list(dict.fromkeys(repos))
+    for repo in repos:
         # First-time bootstrap for a repo: just stamp now() and skip notifications.
         if repo not in last_polled:
             last_polled[repo] = cycle_start
@@ -386,6 +469,18 @@ def poll_once(state: dict, dry_run: bool = False) -> None:
                 continue
 
             archive_path = archive_event(ev)
+
+            # SEED REVIEW: a comment @-mentioning us on a seed-review repo spawns
+            # the persona-seeded reviewer to analyse the PR and post a verdict.
+            # Gated on the @-mention itself (per spec: "analyze ONLY when a
+            # comment @-mentions us"), independent of who authored the PR.
+            if mentions_self(ev.get("body", "")) and is_seed_review_repo(ev["repo"]) \
+                    and ev["kind"] in ("comment", "review_comment", "review"):
+                if dry_run:
+                    print(f"  DRY: would spawn seed-reviewer for {ev['repo']}#{ev['pr']}")
+                else:
+                    launch_seed_review(ev)
+
             if approve and not dry_run:
                 ok, info = approve_pr(ev["repo"], ev["pr"])
                 marker = "AUTO-APPROVED" if ok else "AUTO-APPROVE-FAILED"
@@ -451,6 +546,402 @@ if __name__ == "__main__":
 PY_EOF
 chmod +x "$INSTALL_DIR/bin/gh-pr-watcher.py"
 ```
+
+### 4b. Write `seed-reviewer.py` (inline)
+
+The watcher spawns this when a comment **@-mentions us** on a `SEED_REVIEW_PREFIXES` repo. It clones the PR head into a tmp folder, seeds a persona `CLAUDE.md` (the seed-reviewer engineer), runs a headless `claude` that judges seed-or-not and the **>=90% instructions / <=10% code** bar (almanac/teleprompter as the reference), cross-checked by a deterministic fenced-code line-ratio, then posts the verdict as a PR comment. (4-backtick fence: the script itself contains 3-backtick sequences.)
+
+````bash
+INSTALL_DIR="${INSTALL_DIR:-$HOME/mypeople}"
+cat > "$INSTALL_DIR/bin/seed-reviewer.py" <<'SEED_REVIEWER_PY'
+#!/usr/bin/env python3
+"""mypeople seed-reviewer.
+
+Spawned (by gh-pr-watcher, or run by hand) to review ONE pull request and post
+a verdict comment. The flow, per the spec card 811bfe8cba9d:
+
+  1. Make a tmp work folder and seed it with a persona CLAUDE.md (the
+     "seed-reviewer engineer").
+  2. Clone the PR head into that folder so the engineer reads the real repo.
+  3. Compute a deterministic instruction/code line-ratio over the seed
+     artifact(s) as an objective signal.
+  4. Run a persona-seeded headless `claude` in the folder; it returns a verdict.
+  5. Post the verdict as a PR comment:
+       - not a SEED project -> "I do not review PRs that are not SEED projects."
+       - a SEED, >=90% instructions / <=10% code -> valid
+       - a SEED, but too much code -> not a proper seed
+
+The 90/10 bar (almanac/teleprompter are the named reference seeds): a SEED is
+mostly INSTRUCTIONS (prose telling an agent what to build + how to verify), with
+minimal literal CODE EXAMPLES. "code" = non-blank lines inside fenced blocks
+tagged with a real programming language (py/js/ts/tsx/jsx/go/rust/...). Shell,
+console, text, yaml/json/toml, dockerfile, env and prose count as instructions
+(they are commands to run, config, or output — not product source).
+
+Usage:
+  seed-reviewer.py --repo plow-pbc/almanac-seed --pr 12 [--trigger-comment-id 123]
+  seed-reviewer.py --repo plow-pbc/seedbank --pr 49 --dry-run
+"""
+
+from __future__ import annotations
+import argparse, json, os, re, shutil, subprocess, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Ensure user-local bins (claude) and homebrew (gh) are reachable even when
+# spawned from launchd, whose PATH omits ~/.local/bin.
+for _extra in (str(Path.home() / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"):
+    if _extra not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _extra + os.pathsep + os.environ.get("PATH", "")
+
+INSTALL_DIR = Path(os.environ.get("INSTALL_DIR", str(Path.home() / "mypeople")))
+REVIEW_ROOT = INSTALL_DIR / "run" / "seed-reviews"
+DONE_DIR = REVIEW_ROOT / "done"
+LOG_FILE = INSTALL_DIR / "run" / "seed-reviewer.log"
+
+GH_TIMEOUT = 60
+CLAUDE_TIMEOUT = 600  # the engineer gets up to 10 min to reason
+
+NOT_A_SEED_MSG = "I do not review PRs that are not SEED projects."
+SIGNATURE = "— 🌱 seed-reviewer (mypeople)"
+
+# Fence info-strings that mean "literal product source" -> counts as CODE.
+CODE_LANGS = {
+    "py", "python", "js", "javascript", "jsx", "ts", "typescript", "tsx",
+    "go", "golang", "rust", "rs", "java", "kotlin", "kt", "swift", "c", "cpp",
+    "c++", "cs", "csharp", "ruby", "rb", "php", "scala", "html", "vue", "svelte",
+    "css", "scss", "sass", "sql",
+}
+SEED_FILE_RE = re.compile(r"(^|/)(seed\.md|.*\.seed\.md|SEED\.md)$", re.IGNORECASE)
+
+
+# --- logging -------------------------------------------------------------
+
+def log(msg: str) -> None:
+    line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
+    print(line, flush=True)
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# --- shell helpers -------------------------------------------------------
+
+def run(cmd: list[str], cwd: Path | None = None, timeout: int = GH_TIMEOUT) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 1, "", str(e)
+
+
+def gh_token() -> str:
+    rc, out, _ = run(["gh", "auth", "token"])
+    return out.strip() if rc == 0 else ""
+
+
+# --- deterministic instruction/code metric -------------------------------
+
+def code_ratio(text: str) -> dict:
+    """Classify every non-blank line as code (real-language fence) or
+    instruction (prose, shell, config, output). Returns a metrics dict."""
+    total = code = 0
+    in_fence = False
+    fence_lang = None
+    for raw in text.split("\n"):
+        s = raw.strip()
+        m = re.match(r"^(```+|~~~+)(.*)$", s)
+        if m:
+            if not in_fence:
+                in_fence = True
+                info = m.group(2).strip().split()
+                fence_lang = (info[0].lower() if info else "")
+            else:
+                in_fence = False
+                fence_lang = None
+            continue  # fence markers themselves are neither
+        if not s:
+            continue
+        total += 1
+        if in_fence and fence_lang in CODE_LANGS:
+            code += 1
+    if total == 0:
+        return {"total_lines": 0, "code_lines": 0, "code_pct": 0.0, "instruction_pct": 100.0}
+    code_pct = round(100.0 * code / total, 1)
+    return {
+        "total_lines": total,
+        "code_lines": code,
+        "code_pct": code_pct,
+        "instruction_pct": round(100.0 - code_pct, 1),
+    }
+
+
+def find_seed_files(repo_dir: Path) -> list[Path]:
+    found = []
+    for p in repo_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(repo_dir).as_posix()
+        if "/.git/" in "/" + rel + "/":
+            continue
+        if SEED_FILE_RE.search(rel):
+            found.append(p)
+    # root-level seed files first, then by size desc
+    found.sort(key=lambda p: (len(p.relative_to(repo_dir).parts), -p.stat().st_size))
+    return found
+
+
+# --- PR fetch ------------------------------------------------------------
+
+def clone_pr_head(repo: str, pr: int, dest: Path) -> bool:
+    token = gh_token()
+    if not token:
+        log("  ERROR: no gh token")
+        return False
+    url = f"https://x-access-token:{token}@github.com/{repo}.git"
+    rc, _, err = run(["git", "clone", "--depth", "1", url, str(dest)], timeout=GH_TIMEOUT)
+    if rc != 0:
+        log(f"  clone failed: {err[:300]}")
+        return False
+    rc, _, err = run(["git", "fetch", "--depth", "1", "origin", f"pull/{pr}/head:pr"],
+                     cwd=dest, timeout=GH_TIMEOUT)
+    if rc != 0:
+        log(f"  fetch pr head failed: {err[:300]}")
+        return False
+    rc, _, err = run(["git", "checkout", "pr"], cwd=dest, timeout=GH_TIMEOUT)
+    if rc != 0:
+        log(f"  checkout pr failed: {err[:300]}")
+        return False
+    return True
+
+
+def pr_meta(repo: str, pr: int) -> dict:
+    rc, out, _ = run(["gh", "pr", "view", str(pr), "--repo", repo, "--json",
+                      "title,body,author,headRefName,files,additions,deletions"])
+    if rc != 0:
+        return {}
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {}
+
+
+# --- persona + engineer --------------------------------------------------
+
+PERSONA = """# You are the SEED REVIEWER — a seedlab engineer
+
+You review a single pull request and decide, with a clear head, two things:
+
+1. **Is this a SEED project at all?** A SEED is a self-contained, paste-into-a-
+   fresh-agent product spec: a `SEED.md` / `*.seed.md` that tells a coding agent
+   WHAT to build and HOW to verify it — the agent authors the code. Repos that
+   are ordinary apps, websites, libraries, config, or tooling (even if they live
+   alongside seeds) are NOT seed projects.
+
+2. **If it is a seed, is it a PROPER seed?** The doctrine: a seed is
+   **>= 90% instructions and <= 10% code examples**. almanac-seed and
+   teleprompter-seed are the reference bar — almanac is ~0% literal code.
+   "code" = literal product source embedded in the seed (fenced blocks tagged
+   python/js/ts/tsx/go/rust/... — source you could paste straight into a file).
+   Shell commands to run, verify steps, config, expected output, and prose are
+   INSTRUCTIONS, not code. A proper seed describes the product and lets the agent
+   write it; an improper seed is a code dump with a thin prose wrapper.
+
+You are given a deterministic line-ratio in `metrics.json` as an objective
+signal. Trust it, but apply judgement: a giant shell heredoc that simply writes
+hundreds of lines of source files verbatim is *code in disguise* — count it
+against the seed even if the fence is tagged `sh`. Conversely a couple of tiny
+illustrative snippets do not make an otherwise-prose seed improper.
+
+## Your job
+Read `TASK.md`, inspect the cloned repo under `repo/`, read `metrics.json`, then
+write your verdict to `verdict.json` (and print it). Be terse and decisive.
+"""
+
+TASK_TMPL = """# Review task
+
+Repo: {repo}
+PR #{pr}: {title}
+Author: @{author}
+Changed files ({nfiles}): +{adds}/-{dels}
+
+The PR head is checked out under `./repo/`. Seed artifact(s) detected:
+{seed_list}
+
+`metrics.json` holds the deterministic instruction/code line-ratio computed over
+the seed artifact(s) (code = fenced real-language source lines / total non-blank
+lines).
+
+## Produce `verdict.json` with EXACTLY this schema:
+
+{{
+  "is_seed": true | false,
+  "verdict": "valid" | "not-a-proper-seed" | "not-a-seed",
+  "code_pct": <number>,
+  "instruction_pct": <number>,
+  "reasoning": "<=2 sentences, concrete"
+}}
+
+Rules:
+- If this is not a SEED project -> is_seed=false, verdict="not-a-seed".
+- If it is a seed AND instructions >= 90% and code <= 10% -> verdict="valid".
+- If it is a seed but too much code -> verdict="not-a-proper-seed".
+- For code_pct/instruction_pct, start from metrics.json but adjust if you found
+  code-in-disguise (large verbatim source heredocs); explain in reasoning.
+
+Write the file with the Write tool, then print the JSON. Nothing else.
+"""
+
+
+def run_engineer(workdir: Path, repo: str, pr: int, meta: dict, seed_files: list[str],
+                 metrics: dict) -> dict | None:
+    (workdir / "CLAUDE.md").write_text(PERSONA)
+    (workdir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    seed_list = "\n".join(f"  - {s}" for s in seed_files) or "  (none found)"
+    (workdir / "TASK.md").write_text(TASK_TMPL.format(
+        repo=repo, pr=pr, title=meta.get("title", "?"),
+        author=(meta.get("author") or {}).get("login", "?"),
+        nfiles=len(meta.get("files") or []), adds=meta.get("additions", 0),
+        dels=meta.get("deletions", 0), seed_list=seed_list))
+
+    prompt = ("Read TASK.md and CLAUDE.md, inspect ./repo and ./metrics.json, "
+              "then write ./verdict.json per the schema and print it.")
+    log(f"  running engineer (claude -p) in {workdir} ...")
+    rc, out, err = run(["claude", "-p", prompt, "--dangerously-skip-permissions"],
+                       cwd=workdir, timeout=CLAUDE_TIMEOUT)
+    (workdir / "engineer.stdout").write_text(out)
+    if err:
+        (workdir / "engineer.stderr").write_text(err)
+    if rc != 0:
+        log(f"  engineer rc={rc}: {err[:200]}")
+
+    # Prefer verdict.json on disk; fall back to JSON in stdout.
+    vfile = workdir / "verdict.json"
+    if vfile.exists():
+        try:
+            return json.loads(vfile.read_text())
+        except json.JSONDecodeError:
+            pass
+    m = re.search(r"\{.*\}", out, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+# --- verdict -> comment --------------------------------------------------
+
+def build_comment(verdict: dict, metrics: dict) -> str:
+    is_seed = bool(verdict.get("is_seed"))
+    v = verdict.get("verdict", "")
+    reasoning = (verdict.get("reasoning") or "").strip()
+    code_pct = verdict.get("code_pct", metrics.get("code_pct"))
+    instr_pct = verdict.get("instruction_pct", metrics.get("instruction_pct"))
+
+    if not is_seed or v == "not-a-seed":
+        body = NOT_A_SEED_MSG
+        if reasoning:
+            body += f"\n\n_{reasoning}_"
+        return f"{body}\n\n{SIGNATURE}"
+
+    ratio = f"**{instr_pct}% instructions / {code_pct}% code** (bar: ≥90% / ≤10%)"
+    if v == "valid":
+        head = f"✅ **Valid SEED** — {ratio}."
+    else:
+        head = f"❌ **Not a proper seed** — {ratio}. A seed must be ≥90% instructions / ≤10% code."
+    if reasoning:
+        head += f"\n\n{reasoning}"
+    return f"{head}\n\n{SIGNATURE}"
+
+
+def post_comment(repo: str, pr: int, body: str) -> bool:
+    rc, out, err = run(["gh", "pr", "comment", str(pr), "--repo", repo, "--body", body])
+    if rc != 0:
+        log(f"  post comment failed: {err[:300]}")
+        return False
+    log(f"  posted: {out.strip()}")
+    return True
+
+
+# --- main ----------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--pr", type=int, required=True)
+    ap.add_argument("--trigger-comment-id", default="")
+    ap.add_argument("--trigger-user", default="")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--keep", action="store_true", help="keep the work folder")
+    args = ap.parse_args()
+
+    repo, pr = args.repo, args.pr
+    # Idempotency: never review the same trigger twice.
+    DONE_DIR.mkdir(parents=True, exist_ok=True)
+    sentinel = None
+    if args.trigger_comment_id:
+        sentinel = DONE_DIR / f"{repo.replace('/', '__')}__pr{pr}__{args.trigger_comment_id}"
+        if sentinel.exists() and not args.dry_run:
+            log(f"already reviewed {repo}#{pr} trigger {args.trigger_comment_id}; skipping")
+            return 0
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    workdir = REVIEW_ROOT / f"{repo.replace('/', '__')}__pr{pr}__{ts}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    log(f"=== seed-review {repo}#{pr} (trigger=@{args.trigger_user} {args.trigger_comment_id}) -> {workdir}")
+
+    repo_dir = workdir / "repo"
+    if not clone_pr_head(repo, pr, repo_dir):
+        log("  ABORT: could not fetch PR head")
+        return 1
+
+    meta = pr_meta(repo, pr)
+    seed_paths = find_seed_files(repo_dir)
+    seed_rel = [p.relative_to(repo_dir).as_posix() for p in seed_paths]
+    log(f"  seed files: {seed_rel or '(none)'}")
+
+    combined = "\n".join(p.read_text(errors="replace") for p in seed_paths[:5])
+    metrics = code_ratio(combined) if combined else {
+        "total_lines": 0, "code_lines": 0, "code_pct": 0.0, "instruction_pct": 0.0}
+    metrics["seed_files"] = seed_rel
+    log(f"  deterministic metrics: {metrics}")
+
+    verdict = run_engineer(workdir, repo, pr, meta, seed_rel, metrics)
+    if not verdict:
+        log("  ABORT: engineer produced no verdict")
+        return 1
+    (workdir / "verdict.final.json").write_text(json.dumps(verdict, indent=2))
+    log(f"  verdict: {verdict}")
+
+    body = build_comment(verdict, metrics)
+    log(f"  comment:\n{body}")
+
+    if args.dry_run:
+        log("  DRY-RUN: not posting")
+    else:
+        if not post_comment(repo, pr, body):
+            return 1
+        if sentinel:
+            sentinel.write_text(json.dumps({"ts": ts, "verdict": verdict}, indent=2))
+
+    if not args.keep and not args.dry_run:
+        # keep the artifacts; only drop the heavy clone
+        shutil.rmtree(repo_dir, ignore_errors=True)
+    log(f"=== done {repo}#{pr}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SEED_REVIEWER_PY
+chmod +x "$INSTALL_DIR/bin/seed-reviewer.py"
+````
 
 ### 5. Initialize state (bootstrap — stamp `last_polled_at = now()`)
 
