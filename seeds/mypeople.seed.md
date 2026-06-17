@@ -192,10 +192,14 @@ under `$INSTALL_DIR/run/tailscale-state/`, `tailscale --socket=<sock> up …`, t
 leave a duplicate. A self-install must not kill the very channel that is driving it: stop a
 prior daemon only immediately before relaunching it (graceful in-place handoff), not pre-emptively.
 
-**5.9 Heartbeat-based liveness + self-healing registry.** queue-server reaps an agent whose host
-has been silent `QUEUE_DEAD_AFTER` (≈4 missed heartbeats); clients re-announce their live agents
-every heartbeat so a server restart / false-prune repopulates within one cycle. No zombie
-"alive" agents after a host dies.
+**5.9 Heartbeat-based liveness + self-healing registry + STALE-CLIENT EXPIRY.** queue-server reaps
+an agent whose host has been silent `QUEUE_DEAD_AFTER` (≈4 missed heartbeats); clients re-announce
+their live agents every heartbeat so a server restart / false-prune repopulates within one cycle.
+No zombie "alive" agents after a host dies. **Likewise `/clients` itself EXPIRES stale entries
+(folded 2026-06-17):** a client whose `last_seen` is older than the TTL (≈3–5 heartbeat intervals)
+**drops off `/clients`** — so a node that registered (e.g. `hydrating`) and then died, or any probe
+that stopped heartbeating, does NOT linger forever as a dead phantom on the grid. The grid reflects
+only currently-live registrants. (J26 asserts the fresh grid is clean.)
 
 **5.10 UTF-8 everywhere.** Set `LANG=C.UTF-8`/`LC_ALL=C.UTF-8` for the queue-client/tmux so the
 TUI glyphs (`❯ ● ✻ …`) aren't mangled to underscores.
@@ -246,15 +250,15 @@ CEO's HUD.) "I asked for X substrates, I see X" (§7.1) depends on this isolatio
 The TODO app (`todo-server.py`, `:9933`) serves `todos.html` at `/` and `/todos`, and a JSON API
 (all gated by `X-Queue-Secret` except the page + `/health`):
 - `GET /todo/board` → the board JSON. `POST /todo/update` ops: **`add` `{text}`** (creates a task
-  in `needs_brainstorm`, prepends to `order`, returns `{ok,id}`) and **`add {text, parent}`** (a
-  **subtask** of `parent`), **`del {id}`**, **`set {id,…}`**. **FIELD NAMES — the pinned
-  `assets/todos.html` is the SOURCE OF TRUTH; verify against it, NOT this prose.** The EXACT `set`
-  fields the UI sends are **`text`, `doneCondition`, `workToDone`, `dependsOn`, `hardGate`, `state`,
-  `done`, `assignee`** — note **`state`** (the status field, NOT `status`), **`doneCondition`** (NOT
-  `cond`), **`dependsOn`** (NOT `deps`). `GET /todo/board` returns these SAME names per task. (The
-  earlier `cond`/`deps`/`status` naming was a spec error — folded 2026-06-17.) **Manual reorder is
-  REMOVED — no `reorder` op, no up/down control** (CEO 2026-06-17); the board renders in `order`
-  (newest-first), sorted-visible-then-hidden client-side only.
+  in `needs_brainstorm`, prepends to `order`, returns `{ok,id}`), **`del {id}`**, **`set {id,…}`**.
+  **FIELD NAMES (the contract — your generated page and server MUST agree on these exact names):**
+  the `set` fields are **`text`, `doneCondition`, `workToDone`, `state`, `done`, `assignee`** — note
+  **`state`** (the status field, NOT `status`) and **`doneCondition`** (NOT `cond`). `GET /todo/board`
+  returns these SAME names per task. **DO NOT BUILD (CEO 2026-06-17 — these features are cut):**
+  subtasks (no `add{parent}`, no `parent` field), dependencies (no `dependsOn`), the hard-gate (no
+  `hardGate`), and **manual reorder** (no
+  `reorder` op, no up/down). The board renders in `order` (newest-first), sorted-visible-then-hidden
+  client-side only.
 - `POST /todo/comment {task_id, by, body}` — append a thread comment; **`by` is the author's
   agent_id** for agent comments (`host/sess:tab`), or `"CEO"` for the human.
 - `GET /todo/attach?agent=<agent_id>` → `{ok, target:"mc-<sess>:<tab>", base:"<attach_base>"}` —
@@ -264,14 +268,15 @@ The TODO app (`todo-server.py`, `:9933`) serves `todos.html` at `/` and `/todos`
   question → promotes out of `needs_brainstorm`), `POST /todo/status {task_id, state}`,
   `POST /todo/proof {task_id, kind, url|body}` (kind ∈ image|video|link|text) — thread/state events.
 
-**The UI is a PINNED asset (§A), not generated** — so every front-end feature is present by
-construction. What YOU generate is the **backend that satisfies the exact API the pinned
-`todos.html` calls**: the routes above, the exact `set` field names (`doneCondition`/`dependsOn`/
-`state` — see above), the `state` enum `needs_brainstorm|working|review|blocked|done|cancelled`,
-the board shape (per-task `text`, `state`, `assignee`, `doneCondition`, `workToDone`, `hardGate`,
-`dependsOn`, `parent`, `brainstorm`, `comments[]`, `proofs[]`, `unread`, `verified`, `pingsToBoss`),
-and the board→Boss ping. **§A.2 lists every feature as a MANDATORY
-contract with its Verify gate — none is optional, the blind agent may skip nothing.**
+**You GENERATE both the page and the server** (truly generative — no pinned/pasted UI). They must
+agree on: the routes above, the `set` field names (`doneCondition`/`state` — see above), the `state`
+enum `needs_brainstorm|working|review|blocked|done|cancelled`, the board shape (per-task `text`,
+`state`, `assignee`, `doneCondition`, `workToDone`, `brainstorm`, `comments[]`, `proofs[]`, `unread`,
+`verified`, `pingsToBoss`), and the board→Boss ping. The page authenticates its gated calls with the
+live `QUEUE_SECRET` (serve it injected — e.g. the server replaces an `__INJECT_SECRET__` token in the
+page at serve-time). **§7 specifies the look/feel (PLOW tokens + layout) and §A.2 lists every feature
+as a MANDATORY behavioral contract with its Verify gate — none is optional; the blind agent generates
+all of it and may skip nothing.**
 
 **board→Boss ping (the core value):** on a **non-test** `add` (and on work-state transitions),
 the server **pings the Boss**: `mp send <BOSS_AGENT> "[todo] task <id> \"<title>\": <reason>…"`.
@@ -284,10 +289,11 @@ its `mp send` result to `todos/boss-inbox.log` (write `MP_SEND -> main:Boss rc=<
 
 ## 7. UI/UX + PLOW design system (HUD + TODO share PLOW identity)
 
-> **The two pages are PINNED canonical ASSETS (§A.2), served verbatim — do NOT generate or
-> re-theme them.** This section documents what those assets contain + the backend they require; it
-> is the spec for the generated server, not a license to re-draw the UI. The §A checksum gate (J14)
-> fails any look-alike. The PLOW identity below is already baked into the pinned bytes.
+> **You GENERATE both pages from the design tokens + the contracts below (truly generative — no
+> pasted/pinned components).** The tokens/consts here ARE the spec — use them as literal values so
+> the result LOOKS PLOW; build the components yourself from the natural-language layout + the §A.2
+> feature contracts. Pixel-exactness to any prior app is NOT required (CEO 2026-06-17, Decision B);
+> faithful PLOW look + every gated behavior IS. **No animations/effects anywhere** (J29).
 
 Both pages carry the **Plow Design System v2.0** brand identity (source of truth:
 `plow.co/STYLE-GUIDE.md` in the Plow repo). They are **dark product-UI** (audit/terminal
@@ -400,18 +406,18 @@ Author each from §3–§8. They interoperate because you write them together to
   `main:Boss`. (May reuse the queue-client code pointed at `UPSTREAM_QUEUE_URL`, but fully
   isolated from the inner: separate dir, config, pidfile — the inner's lifecycle never touches it.)
 - `bin/mp` — the CLI (§4 verbs), incl. idempotent spawn + the §4 tmux mapping.
-- `bin/todo-server.py` — GENERATED: the TODO board API + board→Boss ping (§6), serving the PINNED
-  `bin/todos.html` at `/`+`/todos`. Must satisfy every API contract the pinned UI calls (§A.2).
-- `bin/todos.html` — **NOT generated. PINNED canonical ASSET** (§A.2), served verbatim.
-- `bin/dashboard.html` — **NOT generated. PINNED canonical ASSET** (§A.2), served verbatim by
-  queue-server at `/dashboard`; queue-server must satisfy the HUD API contract (`/clients`+`/agents`+
-  `/roster`+`/revive`, §A.2 F17–F22).
+- `bin/todo-server.py` + `bin/todos.html` — GENERATED: the TODO board API + board→Boss ping (§6)
+  and the page, built from the PLOW tokens (§7) + the §A.2 feature contracts. The page + server you
+  write must agree on the §6 API.
+- `bin/dashboard.html` — GENERATED: the HUD (§7/§7.1), built from the PLOW tokens + §A.2 F17–F22,
+  served by queue-server at `/dashboard`; queue-server satisfies `/clients`+`/agents`+`/roster`+
+  `/revive`.
 - `bin/boss-supervisor.sh` — always-one-Boss loop (§5.3).
 - `boss-CLAUDE.md` — generated doctrine (§8).
 - `plugins/tmux-boss-hooks/` — the Claude hooks plugin emitting lifecycle events (§4).
-- `~/.tmux.conf` — **NOT generated. Shipped canonical ASSET** (§A) installed verbatim + TPM
-  (`~/.tmux/plugins/tpm` + `tmux run '…/tpm'` so Dracula renders). Verify gate asserts
-  `sha256(installed ~/.tmux.conf) == canonical` (§A / §15 J14).
+- `~/.tmux.conf` — GENERATED from the settings in §A.1 (his style: Dracula via TPM + the hard-won
+  TUI fixes) + TPM/Dracula install, sourced into the running server. Gated on the RUNNING config
+  (§15 J28), not a file checksum.
 
 ---
 
@@ -434,17 +440,12 @@ Bare host (shell + authed `claude`). State intent; adapt commands to the host.
 3. **Layout + config.** Create `$INSTALL_DIR/{bin,run,status,todos,plugins}`; write
    `~/.config/mypeople/queue.env` (`QUEUE_SECRET` auto-gen if unset, ports, `HOST_ID`,
    `LANG/LC_ALL=C.UTF-8`); set `hasCompletedOnboarding:true` in `~/.claude.json` (§5.5).
-3.5 **INSTALL THE PINNED ASSETS — COPY, DO NOT GENERATE (§A).** Before writing any UI/tmux,
-   **copy the shipped bytes verbatim**: `cp assets/todos.html $INSTALL_DIR/bin/todos.html`,
-   `cp assets/dashboard.html $INSTALL_DIR/bin/dashboard.html`, `cp assets/tmux.conf ~/.tmux.conf`
-   (+ install TPM). **These three files are NOT yours to author.** A prior batch IGNORED this and
-   re-generated its own UI/tmux look-alikes, then self-reported DONE — a FALSE GREEN. **If
-   `sha256(bin/todos.html|bin/dashboard.html|~/.tmux.conf)` ≠ the §A pin, you have FAILED J14** —
-   do not "improve", re-theme, or regenerate them. The only code you write for the UI is the
-   *server* that serves these files (replacing `__INJECT_SECRET__`, §A).
-4. **GENERATE the remaining components** (§11 — servers, `mp`, supervisor, hooks, doctrine) from the
-   spec — write the code now, to the §4–§8 contracts. **The UI/tmux are already installed (Step 3.5);
-   never overwrite them.**
+4. **GENERATE every component** (§11 — servers, the TWO pages, `mp`, supervisor, hooks, doctrine,
+   `~/.tmux.conf`) from the spec — write the code now, to the §4–§8 contracts. **The UI is generated
+   from the PLOW tokens (§7) + the §A.2 feature contracts** (truly generative — no pasted components;
+   pixel-exactness not required, faithful PLOW + every gated behavior is). **`~/.tmux.conf` is
+   generated from §A.1's settings**, then TPM + Dracula installed and the conf **sourced into the
+   running tmux server** (J28 checks the LIVE server, not a file).
 5. **Tailnet** (§5.6): userland `tailscaled` + `tailscale up` + default-socket symlink; capture
    the `100.x` IP — the uplink's `attach_base` updates to it on the next heartbeat.
 6. **Start INNER daemons** (§5.8): `queue-server` (wait `/health`), `queue-client` (heartbeat with
@@ -482,7 +483,7 @@ kill ephemeral test workers.
 
 > **CANONICAL ACCEPTANCE = a SINGLE STANDALONE node with NOTHING pre-existing.** The real test is
 > one fresh host, `UPSTREAM_QUEUE_URL` UNSET, no hub/fleet anywhere, reaching exit 0 on J1–J11 +
-> J14–J25 (its own inner `:9900` is the central + HUD). **Verify must NOT depend on any
+> J14–J29 (its own inner `:9900` is the central + HUD). **Verify must NOT depend on any
 > pre-existing hub** — if a gate only passes because a prior-generation central happens to exist,
 > the test is contaminated (CEO 2026-06-17). FLEET mode (J12/J13) is a SEPARATE, opt-in scenario:
 > to test it, generate a FRESH hub from THIS seed first (a standalone node = a central), then JOIN
@@ -498,6 +499,10 @@ kill ephemeral test workers.
    contains it with `state=alive`; the Boss's onboarding summary carries ≥2 doctrine keywords
    (plan/approve/queue/mp/fire-and-forget/autonomous). *(Assert the INSTALLED Boss — do not spawn
    a fresh one to mask a missing one. No Boss in the HUD = FAIL, even if everything else passes.)*
+   **The summary must be DURABLE (folded 2026-06-17, mpgen5-1/-3):** the Stop hook overwrites the
+   Boss's roster summary on its next idle turn, so a doctrine summary captured at onboarding can be
+   clobbered to a generic line — persist the onboarding summary so it survives later Stop-hook
+   writes (don't assert a freshly-spawned Boss to mask this).
 3. **Board → Boss ping.** Add a **non-test** task via `POST /todo/update {op:add,text:…}` while
    the Boss is idle. *Expect:* it lands on `/todo/board` AND the **Boss pane receives the
    `[todo] … <taskId> …` ping** within ~30s (key off pane-delivery; a busy Boss may rc=1 yet the
@@ -521,10 +526,14 @@ kill ephemeral test workers.
     connected machine (one card per `/clients` entry) **grouped by `purpose` with a per-group
     count header**, NOT a flat total. *Assert:* `GET /clients` carries `purpose`/`node_type`/
     `recording_url`; the served HUD HTML implements per-`purpose` grouping + counts and per-card
-    `type/machine/state/attach/recording`; and seeding two heartbeats with distinct purposes
-    (e.g. `POST /heartbeat purpose=mypeople` ×N and `purpose=airbnb` ×M) yields exactly two
-    groups whose counts are N and M (e.g. `mypeople hydration · N`). This is the "I asked for X,
-    I see X" check — the CEO counts the cards under a hydration's group.
+    `type/machine/state/attach/recording`. To exercise grouping, **test it in ISOLATION — NEVER
+    seed synthetic clients into the LIVE central.** Either group an in-memory/throwaway client list,
+    or hit a **throwaway queue-server on a scratch port** that you kill afterward. **If you must
+    POST probe heartbeats, you MUST unregister/delete every one before the gate returns AND assert
+    `/clients` is back to exactly the real node(s).** Probe hosts/IPs must be obviously-synthetic
+    and **removed** — they may NOT linger on the product grid (CEO 2026-06-17: a fresh HUD showed
+    phantom `alpha/beta/retiredtest` groups + dead `hydrating` nodes left by an un-cleaned grid
+    test). This is the "I asked for X, I see X" check — the CEO counts the cards under a group.
 12. **Two-plane isolation — inner install never knocks the node off the central grid (§5.11).**
     **(FLEET-MODE ONLY — SKIP this gate entirely when `UPSTREAM_QUEUE_URL` is unset; a standalone
     install has no OUTER plane and is still fully Done.)** Prove the OUTER uplink and INNER product
@@ -547,16 +556,13 @@ kill ephemeral test workers.
     with `state=hydrating` while `:9900` is still down), and after install it shows `state=ready`.
     A node that only appears on the hub AFTER its inner is up = the uplink-late regression ⇒ FAIL.
     (N substrates must show as `hydrating` on the grid concurrently while they build — not 1.)
-14. **Asset parity — ON-DISK == canonical (§A).** Verify computes `sha256` of the installed
-    `~/.tmux.conf`, `bin/todos.html`, `bin/dashboard.html` and asserts each equals the §A pin
-    (`9169…d920e`, `e8fb…ff95`, `cf32…1f6e`). **Compare the on-disk file (it keeps the
-    `__INJECT_SECRET__` token), NOT the served bytes** (the server injects the live secret at
-    serve-time, so served ≠ disk by design). ANY mismatch (a re-themed/re-generated look-alike, or a
-    stale asset) = FAIL. The asset MUST be installed by **copying the shipped bytes** (`cp
-    assets/… bin/…`), never authored — **if you generated your own UI/tmux, J14 fails** (this is the
-    look-alike regression; CEO 2026-06-17). **Also assert manual reorder is GONE:** the disk
-    `todos.html` contains no `op:'reorder'` / `.ictrl up` / `.ictrl down`, and `update{op:reorder}`
-    is unsupported.
+14. **Generative UI fidelity (Decision B — NO checksum).** The UI is GENERATED, not pinned: assert
+    the served `:9933/` and `:9900/dashboard` (a) carry the **PLOW tokens** — Volt `#D5EF8A` +
+    `Instrument Serif`/`DM Sans`/`DM Mono` (also J9); (b) are **not a pasted prior component** — the
+    seed ships NO UI bytes to diff against; correctness = passing the behavioral F-gates, not byte
+    identity; (c) contain **no `@keyframes`/`animation:`** (J29) and **no manual reorder** (`op:'reorder'`
+    unsupported, no up/down control). A faithful PLOW UI that clears every gate is correct even though
+    it is not pixel-identical to any prior app.
 15. **Delete task.** `update{op:del,id}` removes the task from `/todo/board` (tasks + order). (F2)
 16. **Inline edit.** `update{op:set,id,text|doneCondition|assignee}` patches that field (note the
     REAL names per §6); read back on the board. (F3)
@@ -573,15 +579,55 @@ kill ephemeral test workers.
     comment is added by someone other than the reader. (F9)
 22. **Proofs.** `/todo/proof{task_id,kind,url|body}` (kind ∈ image|video|link|text) appends to the
     task's `proofs[]`, returned on the board. (F10)
-23. **Dependencies.** `set{id,dependsOn:[ids]}` persists; the board returns `dependsOn` for the task
-    (field is **`dependsOn`**, NOT `deps`). (F13)
+23. **NO subtasks / dependencies / hard-gate (REMOVED — CEO 2026-06-17).** Assert these are ABSENT:
+    the generated `todos.html` contains no "Add subtask", "add a dependency", "blocked by", or "hard
+    gate" controls; and the backend does NOT implement `add{parent}` / `parent`, `dependsOn`, or
+    `hardGate` (a `set` with those keys is ignored/rejected, not persisted). Any of these present =
+    FAIL (the feature was explicitly cut). (replaces old F13)
 24. **Verified badge.** A task with `verified=true` on the board is served with the "verified"
     badge in the page. (F16)
 25. **Retired + revive.** `/roster` carries `retired` entries; `POST /revive{agent_id}` clears the
-    retired flag (agent re-eligible), reflected on the next `/roster`. (F21)
+    retired flag (agent re-eligible), reflected on the next `/roster`. (F21) **Test it WITHOUT
+    leaving a phantom:** any agent/host you register to exercise retire/revive MUST be removed before
+    the gate returns — no `retiredtest`/`ghosthost`-style residue on the live `/roster` or grid.
+26. **FRESH-INSTALL GRID IS CLEAN — no test/demo fixtures (CEO 2026-06-17, gates MISSED this).**
+    After `## Steps`+`## Verify` finish, `GET /clients` on the node's OWN central returns **ONLY
+    the real node(s)** — for a standalone install, **exactly ONE entry (this node)**. **ZERO
+    synthetic purpose-groups** (`alpha`/`beta`/`qa-*`/`airbnb`/`retiredtest`/`demo`/`ghosthost`…),
+    ZERO dead/stale `hydrating` phantoms. A real user's fresh install ships with a grid of itself
+    and nothing else. Belt-and-suspenders at the product layer: the **queue-server EXPIRES stale
+    clients** (a client whose last heartbeat is older than a TTL, e.g. ~3–5 heartbeat intervals,
+    drops off `/clients`) so nothing dead lingers. ANY seeded fixture or stale phantom on the fresh
+    grid = FAIL.
+27. **Attach links resolve to a REAL host — never a placeholder (CEO 2026-06-17).** Every
+    `attach_base` advertised in `/clients`/`/agents` and every ATTACH link the HUD renders MUST
+    contain the node's **real reachable host** (its `100.x` tailnet IP per §5.2) — **never a literal
+    placeholder (`x`, `100.0.0.0`, `<host>`, empty) and never `127.0.0.1` for a remote-reachable
+    link.** *Assert:* the node's own `attach_base` matches its `tailscale ip -4`; the rendered
+    `ATTACH BOSS` href is `http://<100.x>:7681/?arg=-t&arg=mc-main:Boss` and returns 200 on a live
+    pane (§J8). A placeholder host in any attach link = FAIL.
 
-> Gates J14–J25 are NON-OPTIONAL (CEO 2026-06-17): the Verify harness MUST assert every one. A
-> green run with any F-feature unexercised is a FALSE GREEN — the harness itself fails the check.
+28. **RUNNING tmux IS his config — not just the file on disk (CEO 2026-06-17, J14-on-disk was a
+    FALSE GREEN).** Assert against the **LIVE tmux server** the Boss/agents actually run in (the
+    `mc-*` sessions), via `tmux show-options -g` / `tmux list-keys`, NOT the file: **`base-index`
+    is `1`** (not 0), **`history-limit 50000`**, **`renumber-windows on`**, `escape-time 10`,
+    `default-terminal "tmux-256color"`; **`WheelUpPane`/`WheelDownPane` are UNBOUND at `-T root`**
+    (his anti-trap fix — they must NOT appear in `list-keys -T root`); **`MouseDragEnd1Pane` is bound
+    to `copy-pipe-and-cancel`**; and **Dracula is loaded** — verify by the RUNNING status bar being
+    Dracula's (not the default `%H:%M %d-%b-%y`); note TPM clones `@plugin 'dracula/tmux'` into
+    `~/.tmux/plugins/**tmux**` (the repo basename, NOT `~/.tmux/plugins/dracula`) — folded 2026-06-17,
+    so check the status bar behavior, not a fixed dir name. If the live server runs defaults
+    while the file is correct = the "server started before the conf / TPM never installed" regression
+    ⇒ FAIL.
+29. **Clean minimalist — NO animations/effects (CEO 2026-06-17).** The generated `dashboard.html` +
+    `todos.html` contain **zero `animation:` / `@keyframes`** (no zoom/pulse on the `hydrating` state
+    label or the live-dot, no fade-in on tasks). Assert the served/disk pages match the §A pins AND
+    contain no `@keyframes`/`animation:` declarations. Any animation on a state label = FAIL.
+
+> Gates J14–J29 are NON-OPTIONAL (CEO 2026-06-17): the Verify harness MUST assert every one. A
+> green run with any F-feature unexercised — OR that leaves ANY test fixture / placeholder host on
+> the live grid, runs default tmux, or shows ANY animation — is a FALSE GREEN, and the harness
+> itself fails the check.
 
 ---
 
@@ -614,96 +660,54 @@ kill ephemeral test workers.
 
 ---
 
-## A. Canonical ASSETS — shipped verbatim, NOT generated (the design-vs-spec exception)
+## A. UI + tmux — GENERATED from spec (truly generative; Decision B 2026-06-17)
 
-Behavior/protocol/runtime are **generated** from §4–§8 (they ARE specs → reproduce faithfully).
-But **bespoke design artifacts are NOT generatable from prose** — blind generation yields a
-functional look-alike, not *our* product. So these files are **shipped verbatim** and
-**sha256-pinned**; the generated runtime must *serve them unchanged* and satisfy the API contract
-they call. Install each by writing the exact bytes below (do not re-design, re-theme, or
-"improve"). Each has a Verify gate asserting `sha256(installed) == canonical`.
+**No pinned/pasted components, no sha256 checksum.** You GENERATE `bin/todos.html`,
+`bin/dashboard.html`, and `~/.tmux.conf` yourself from the **design tokens/consts** (small spec
+values — fine and wanted, so the result LOOKS PLOW) plus the natural-language layout (§7) and the
+behavioral feature contracts (§A.2). The **≤10% code budget = tokens/consts only, never pasted
+components.** Pixel-exactness to any prior app is NOT required; faithful PLOW look + every gated
+behavior IS (verified behaviorally, §A.2 + §15 — there is no byte-identity gate).
 
-| Asset | Install path | Canonical sha256 |
-|---|---|---|
-| `tmux.conf` | `~/.tmux.conf` | `9169409877764c61de2d29b3bc72c36523617b3d24f95689f40ca1ac47ed920e` |
-| `todos.html` | `bin/todos.html` (served at TODO `/` + `/todos`) | `e8fb75453e215672cb3d6a8e78ceb09ea39c38460959c02b7d7ed81e5111ff95` |
-| `dashboard.html` | `bin/dashboard.html` (served at `/dashboard`) | `cf3215effbac35fda062408790293925eec882782aa261f5f7c7c3e0d6b91f6e` |
+**Secret-injection guidance:** the page must authenticate its gated API calls with the live
+`QUEUE_SECRET`. Simplest: the generated server serves the page with an `__INJECT_SECRET__` token
+replaced by the live secret at serve-time. (Implementation is yours; the contract is only that the
+served page can call the gated endpoints.)
 
-**Secret-injection contract (pinned — was an unspecified fork that broke parity):** both pinned
-pages contain the literal token **`__INJECT_SECRET__`** (`const SECRET="__INJECT_SECRET__"`). The
-generated `todo-server.py` and `queue-server.py` MUST serve each page with `__INJECT_SECRET__`
-replaced by the live `QUEUE_SECRET` at serve-time (so the page's gated API calls authenticate).
-**The checksum gate (J14) is computed on the ON-DISK asset (which still contains the token), NOT on
-the served bytes** (served bytes differ by the injected secret, by design).
+**§A.1 `~/.tmux.conf` — GENERATE it to apply the CEO's style (his settings are the consts below;
+this is NOT a pasted file and there is NO checksum — J28 gates the RUNNING server, not bytes).**
+Apply exactly these settings (the tmux tension is resolved by shipping his *settings as consts* and
+generating the file + gating behavior):
+- **Dracula via TPM:** `@plugin 'tmux-plugins/tpm'`, `@plugin 'dracula/tmux'`; `@dracula-plugins
+  "cpu-usage ram-usage time"`, `@dracula-show-powerline false`, `@dracula-show-left-icon session`,
+  `@dracula-military-time true`, `@dracula-day-month false`, `@dracula-show-timezone false`.
+- **General:** `default-terminal "tmux-256color"` + `terminal-overrides ",xterm-256color:Tc"`,
+  `mouse on`, **`base-index 1`**, `pane-base-index 1`, **`renumber-windows on`**,
+  **`history-limit 50000`**, **`escape-time 10`**.
+- **Hard-won TUI fixes (REQUIRED):** **UNBIND `WheelUpPane`/`WheelDownPane` at `-T root`** (the Claude
+  TUI renders on the main screen and tmux's default wheel→`copy-mode -e` silently traps every
+  keystroke); and bind `MouseDragEnd1Pane` to **`copy-pipe-and-cancel`** (NOT plain `copy-pipe` — without
+  `-and-cancel` the pane stays stuck in copy-mode). `pbcopy` is macOS-only → a no-op in the container,
+  harmless; keep the structural fix.
+- End with `run '~/.tmux/plugins/tpm/tpm'`.
 
-The verbatim bytes of all three ship with this seed in `seeds/assets/{tmux.conf,todos.html,dashboard.html}`.
-A blind paste installs each by copying those bytes unchanged (the tmux.conf is also inlined at §A.1).
+**THEN — the file alone is NOT enough; the RUNNING server must load it (this was a FALSE GREEN):** a
+prior node had the right conf on disk yet the live server ran defaults (`WheelUpPane` bound,
+`base-index 0`, no Dracula) because the server started before the conf and TPM/Dracula were never
+installed. So: (1) `git clone tpm` + `~/.tmux/plugins/tpm/bin/install_plugins` (clones Dracula); (2)
+`tmux source-file ~/.tmux.conf` on any running server (or place the conf before any server starts);
+(3) every `mc-*` Boss/agent session must run in a server that loaded it. **J28 verifies the LIVE
+server, not the file.**
 
-**§A.1 `~/.tmux.conf` (the CEO's tmux style — Dracula + the hard-won TUI fixes).** Write exactly:
+**§A.2 UI feature contracts — GENERATED `todos.html` + `dashboard.html`, every feature MANDATORY +
+behaviorally gated.** You generate both pages (from §7 tokens + the layout) and the servers; each row
+is a behavioral contract with a Verify gate (J-id) that exercises it. NO feature is optional; the
+blind agent generates all of it and may skip nothing. (No byte-identity check — a faithful PLOW UI
+that passes every gate is correct, per Decision B.)
 
-```tmux
-# ── Dracula Theme ──────────────────────────────────────────
-set -g @plugin 'tmux-plugins/tpm'
-set -g @plugin 'dracula/tmux'
+**TODO (generated `todos.html` + `todo-server.py`, `:9933`) — every gate:**
 
-set -g @dracula-plugins "cpu-usage ram-usage time"
-set -g @dracula-show-powerline false
-set -g @dracula-show-left-icon session
-set -g @dracula-military-time true
-set -g @dracula-day-month false
-set -g @dracula-cpu-usage-label "CPU"
-set -g @dracula-ram-usage-label "RAM"
-set -g @dracula-show-timezone false
-
-# ── General ───────────────────────────────────────────────
-set -g default-terminal "tmux-256color"
-set -ga terminal-overrides ",xterm-256color:Tc"
-set -g mouse on
-set -g base-index 1
-setw -g pane-base-index 1
-set -g renumber-windows on
-set -g history-limit 50000
-set -sg escape-time 10
-
-# ── Mouse selection ───────────────────────────────────────
-unbind-key -T copy-mode    MouseDown1Pane
-unbind-key -T copy-mode-vi MouseDown1Pane
-# copy-pipe-and-cancel (NOT copy-pipe) — without -and-cancel the pane stays
-# in copy-mode after every mouse-drag selection and silently swallows the
-# user's next keystrokes until they press Escape.
-bind-key   -T copy-mode    MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"
-bind-key   -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"
-
-# ── Mouse-wheel scroll ────────────────────────────────────
-# Claude TUI renders on the MAIN screen (alternate_on=0) and does not
-# request mouse mode, so tmux's default WheelUpPane binding falls through
-# to `copy-mode -e` and silently traps every subsequent keystroke until
-# Escape. Kill the wheel→copy-mode path entirely. Use `prefix [` for
-# explicit scrollback when needed.
-unbind-key -T root WheelUpPane
-unbind-key -T root WheelDownPane
-
-# ── TPM (must be last) ────────────────────────────────────
-run '~/.tmux/plugins/tpm/tpm'
-```
-
-Then install TPM + plugins so the Dracula status bar actually renders:
-`git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm` and, in a tmux server,
-`~/.tmux/plugins/tpm/bin/install_plugins`. **Caveat:** `pbcopy` is macOS-only — in the Linux
-container the copy binding is a harmless no-op (fails silently on drag, never at config-load); the
-substantive fixes (wheel/copy-mode un-trap, escape-time, base-index, Dracula) all apply. Ship the
-file **byte-for-byte** so the checksum gate passes; do not substitute a Linux clipboard tool.
-
-**§A.2 `bin/todos.html` + `bin/dashboard.html` (the real product UI) — served verbatim, every
-feature a MANDATORY gated contract.** Both ship verbatim from `seeds/assets/`, sha256-pinned, served
-unchanged. Because the UI is pinned, every front-end feature is present by construction; the blind
-agent generates the **backend** that satisfies the exact API each pinned page calls. **NO feature is
-optional. NO "endpoint exists but UI unspecified."** Each row below is a contract; Verify has a gate
-(J-id) that exercises it; any missing/wrong = FAIL.
-
-**TODO backend (`todo-server.py`, `:9933`) — every gate:**
-
-| # | Feature (what the pinned UI does) | Backend contract | Gate |
+| # | Feature (the generated UI must do this) | Contract | Gate |
 |---|---|---|---|
 | F1 | add task (Enter) | `update{op:add,text}` → task in `needs_brainstorm`, prepended to `order` | J3 |
 | F2 | delete task | `update{op:del,id}` removes from tasks+order | J15 |
@@ -717,7 +721,7 @@ optional. NO "endpoint exists but UI unspecified."** Each row below is a contrac
 | F10 | proofs (image/video/link/text + more) | `/todo/proof{task_id,kind,url\|body}` appends to `proofs[]`; board returns them | J22 |
 | F11 | assignee chip → attach to that engineer's terminal | `/todo/attach?agent=` resolves `{target,base}` (live) | J7 |
 | F12 | ITEM 3 — clickable commenter agent name → terminal | same resolver; non-agent (`CEO`) authors are plain text | J7 |
-| F13 | dependencies + subtasks | `set{dependsOn:[ids]}` (field **`dependsOn`**); `add{text,parent}` for subtasks; board returns `dependsOn`/`parent` | J23 |
+| ~~F13~~ | ~~dependencies/subtasks/hard-gate~~ **REMOVED (CEO 2026-06-17)** | backend must NOT implement `add{parent}`/`dependsOn`/`hardGate`; generated UI has no such controls | J23 (negative) |
 | F14 | board→Boss ping on non-test add | `mp send <BOSS_AGENT>` logged to `boss-inbox.log` (§6); test tasks exempt | J3 |
 | F15 | ITEM 2 — cross-nav HUD ↗ | static link to `:9900/dashboard` (built from `location.hostname`) | J6 |
 | F16 | verified badge | board returns `verified`; UI shows the "verified" badge | J24 |
@@ -733,7 +737,9 @@ optional. NO "endpoint exists but UI unspecified."** Each row below is a contrac
 | F21 | retired engineers + Revive button | `/roster` carries `retired`; `POST /revive{agent_id}` works | J25 |
 | F22 | ITEM 2 — cross-nav TODO ↗ + live/stale pill + counts | static link to `:9933`; counts from `/clients`+`/agents` | J6 |
 
-**§A.3 Gate (J14) — checksum, the parity guarantee.** Verify computes `sha256` of each installed
-asset (`~/.tmux.conf`, `bin/todos.html`, `bin/dashboard.html`) and asserts equality with the §A
-table; ANY mismatch = FAIL. This is what makes "generated == OUR EXACT product," not a look-alike.
-The F-gates above then prove the generated backend satisfies every feature the pinned UI invokes.
+**§A.3 How the UI is verified now (Decision B — behavioral, NOT checksum).** There is **no
+byte-identity / sha256 gate**. The generated UI is correct when: it carries the PLOW tokens (J9 —
+Volt `#D5EF8A` + Instrument Serif/DM Sans/DM Mono), has **no animations** (J29), omits the cut
+features (J23: no subtasks/deps/hard-gate, no reorder), and **passes every F-gate above** (the
+behaviors). A faithful PLOW look that clears all gates IS the product — pixel-exactness is not
+required. tmux fidelity is gated on the RUNNING server (J28).
