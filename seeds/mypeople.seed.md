@@ -81,12 +81,19 @@ live terminal.
 **Queue-server HTTP API** (bind `0.0.0.0:9900`; every route except `/health` and `/dashboard`
 requires header `X-Queue-Secret: <QUEUE_SECRET>`; JSON bodies):
 - `GET /health` → `{"status":"ok","uptime":N}` (public).
-- `GET /clients` → array of `{hostname, attach_base, substrate_ready, last_seen}`.
+- `GET /clients` → array of `{hostname, attach_base, substrate_ready, last_seen, purpose,
+  node_type, recording_url}` — the last three back the HUD machines-grid (§7.1): `purpose` =
+  the hydration/group label (e.g. `mypeople`, `airbnb`); `node_type` ∈ {`one-shot-eng`,
+  `long-lived-eng`, `system-agent`, `in-substrate-install-eng`}; `recording_url` = the node's
+  seedrec recording link (may be empty).
 - `GET /agents` → array of agent records (the HUD's source of truth for who's alive).
 - `POST /agents/register` `{agent_id, backend, state, boss_id, is_master}`; `POST
   /agents/unregister` `{agent_id}`.
-- `POST /heartbeat` `{hostname, attach_base, substrate_ready}` → liveness + the host's
-  re-announced agents. **`attach_base` contract: see §5.2.**
+- `POST /heartbeat` `{hostname, attach_base, substrate_ready, purpose, node_type,
+  recording_url}` → liveness + the host's re-announced agents. **`attach_base` contract: see
+  §5.2.** `purpose`/`node_type`/`recording_url` are read from the node's config
+  (`NODE_PURPOSE` / `NODE_TYPE` / `NODE_RECORDING_URL` in `queue.env`; `purpose` defaults to
+  `mypeople`, `node_type` to `system-agent`) and surface in `/clients` for the §7.1 grid.
 - `POST /task/submit` `{type(send|peek|kill|spawn|answer|revive), target_agent, payload}` →
   `{task_id}`; `GET /task/poll?hostname=<h>` (clients long/short-poll their tasks); `POST
   /task/result` `{task_id, ok, result}`; `GET /task/<id>` → task status+result (submitters wait
@@ -220,6 +227,18 @@ backgrounds ONLY), Grove `#5E7A5E`, Iris `#C4BFFF`; surfaces `--dark-bg #111110`
 ATTACH) where `alive` renders in Volt; an **ATTACH** link per agent =
 `<attach_base>/?arg=-t&arg=<tmux_target>` (opens the live pane); a **"Retired engineers"** table
 with a per-engineer **Revive** (Volt) button. Polls `/agents`+`/clients`+`/roster` every ~3s.
+
+**§7.1 Machines grid (CEO requirement — confirm "I asked for X, I see X").** The HUD must render
+a **grid of every machine/container connected to the grid** (one card per `/clients` entry),
+**GROUPED BY `purpose`/hydration, with a per-group COUNT in the group header** — e.g. a
+`mypeople hydration · 5` group and an `airbnb hydration · 3` group, **never a single flat
+total**. The grouping + counts are the whole point: the CEO asks for X substrates of a hydration
+and visually confirms exactly X cards under that group. Each node card shows: **type**
+(`node_type`: one-shot eng / long-lived eng / always-running system agent / in-substrate install
+eng), **machine** (`hostname`), **state** (alive/dead from liveness; Volt when alive), an
+**attach link** (`<attach_base>/?arg=-t&arg=mc-main:Boss`, or the node's primary agent), and the
+**seedrec recording link** (`recording_url`, shown only when present). Counts are derived live
+from `/clients` (group by `purpose`, count members) — they update as nodes join/leave.
 
 **TODO (`/`):** Instrument-Serif "Priorities"; add-a-task input (Enter to add); the board
 columns/cards; a **card modal** with the comment **thread**.
@@ -376,6 +395,14 @@ kill ephemeral test workers.
    typefaces (`Instrument Serif`/`DM Sans`/`DM Mono`).
 10. **Reachable from the human's machine.** The HUD + TODO answer 200 on the node's **tailnet
     IP** (not just localhost) — i.e. `attach_base`/pages use the `100.x` address (§5.2).
+11. **Machines grid grouped by purpose with counts (§7.1).** The HUD renders a grid of every
+    connected machine (one card per `/clients` entry) **grouped by `purpose` with a per-group
+    count header**, NOT a flat total. *Assert:* `GET /clients` carries `purpose`/`node_type`/
+    `recording_url`; the served HUD HTML implements per-`purpose` grouping + counts and per-card
+    `type/machine/state/attach/recording`; and seeding two heartbeats with distinct purposes
+    (e.g. `POST /heartbeat purpose=mypeople` ×N and `purpose=airbnb` ×M) yields exactly two
+    groups whose counts are N and M (e.g. `mypeople hydration · N`). This is the "I asked for X,
+    I see X" check — the CEO counts the cards under a hydration's group.
 
 ---
 
