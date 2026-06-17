@@ -228,7 +228,7 @@ ul{list-style:none}
     <div>
       <div class="brand">
         <div class="mark"><span>P</span></div>
-        <div><h1>Priorities</h1><div class="subt">Boss source-of-truth · MyPeople</div></div>
+        <div><h1>Priorities</h1><div class="subt">Boss source-of-truth · MyPeople · <a class="navlink" href="#" onclick="window.open('http://'+location.hostname+':9900/dashboard','_blank','noopener');return false;" title="Open the MyPeople HUD" style="color:#D5EF8A;text-decoration:none;border-bottom:1px dotted #D5EF8A">HUD ↗</a></div></div>
       </div>
       <div class="counts" id="counts"></div>
     </div>
@@ -743,7 +743,7 @@ function evHtml(it){
   }else{ body=`<div class="ev-text md">${mdToHtml(it.body)}</div>`; }
   const kindLbl = it.kind==='comment' ? '' : `<span class="ev-kind">${esc(it.kind)}</span>`;
   return `<div class="ev ev-${it.kind}"><div class="av ${evClass(it.by,it.kind)}">${esc(initials(it.by))}</div>`+
-    `<div class="ev-body"><div class="ev-hd"><span class="ev-by">${esc(byLabel(it.by))}</span>${kindLbl}`+
+    `<div class="ev-body"><div class="ev-hd"><span class="ev-by${isAttachable(it.by)?' attach':''}"${isAttachable(it.by)?` data-attach="${esc(it.by)}" title="open terminal: ${esc(byLabel(it.by))}" style="cursor:pointer;text-decoration:underline dotted"`:''}>${esc(byLabel(it.by))}</span>${kindLbl}`+
     `<span class="ev-time">${reltime(it.ts)}</span></div>${body}</div></div>`;
 }
 
@@ -807,6 +807,7 @@ function postComment(){ const v=cardCompose.value.trim(); if(!v||!cardOpenId)ret
 
 document.getElementById('cardClose').onclick=closeCard;
 cardSub.onclick=e=>{ const c=e.target.closest('.tag.attach'); if(c&&c.dataset.attach) attachToEngineer(c.dataset.attach); };
+cardThread.onclick=e=>{ const a=e.target.closest('.ev-by.attach'); if(a&&a.dataset.attach) attachToEngineer(a.dataset.attach); };  // ITEM 3: click a commenter's agent name -> open its live terminal
 document.getElementById('cardCommentBtn').onclick=postComment;
 cardCompose.onkeydown=e=>{ if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){ e.preventDefault(); postComment(); } };
 modal.onclick=e=>{ if(e.target===modal) closeCard(); };          // click backdrop to close
