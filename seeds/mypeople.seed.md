@@ -2640,7 +2640,14 @@ export TODO_HTML="$INSTALL_DIR/bin/todos.html"
 TODO_LISTEN_PORT=9933
 QUEUE_URL_LOCAL="http://127.0.0.1:${QUEUE_PORT:-9900}"
 pkill -f "$INSTALL_DIR/bin/todo-server.py" 2>/dev/null || true; sleep 1
+# CRITICAL (board->Boss wiring): todo-server pings the Boss on every add-task via
+# `mp send` — it resolves `mp` with shutil.which(), so `mp` MUST be on the server
+# process's PATH. The nohup'd server does NOT inherit an interactive shell's PATH
+# (Step 10's ~/.bashrc fix only affects interactive shells), so EXPORT mp's dir
+# here. Without it shutil.which("mp")==None and EVERY board->Boss ping silently
+# NO-OPs: the task lands on the board but the Boss is never told (observed bug).
 ( cd "$INSTALL_DIR" && \
+  PATH="$HOME/.local/bin:$INSTALL_DIR/bin:$PATH" \
   QUEUE_PORT="$TODO_LISTEN_PORT" QUEUE_URL="$QUEUE_URL_LOCAL" QUEUE_SECRET="${QUEUE_SECRET:-}" \
   TODO_DIR="$TODO_DIR" TODO_HTML="$TODO_HTML" \
   nohup python3 "$INSTALL_DIR/bin/todo-server.py" > "$INSTALL_DIR/run/todo-server.log" 2>&1 & )
@@ -3027,6 +3034,17 @@ ps -ax -o command | grep -E 'ttyd.*-a.* tmux attach' | grep -qv grep || { echo "
 ps -ax -o command | grep -E 'ttyd.*disableLeaveAlert' | grep -qv grep || { echo "FAIL: ttyd not running with disableLeaveAlert — closing the HUD attach tab will prompt the user"; ps -ax -o command | grep ttyd | head -3; exit 1; }
 # End-to-end: attach URL with args must return 200 (not just trigger 404 or default)
 curl -fsS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${TTYD_PORT:-7681}/?arg=-t&arg=mc-main:Boss" | grep -q '^200$' || { echo "FAIL: ttyd attach-URL with args does not return 200"; exit 1; }
+# A 200 alone does NOT prove the attach OPENS THE LIVE PANE (a 200 with a dead/missing
+# target renders a blank/exited terminal to the CEO). Assert the attach actually serves
+# a LIVE pane: (1) ttyd is bound on the ADVERTISED port (queue.env TTYD_PORT == listener
+# port == attach_base port the HUD hands the CEO — a port-drift here = a dead HUD link),
+# and (2) the attach target mc-main:Boss is a LIVE (non-dead) pane running the agent.
+ADV_PORT="$(grep ^TTYD_PORT= ~/.config/mypeople/queue.env | cut -d= -f2-)"; ADV_PORT="${ADV_PORT:-7681}"
+(ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -qE "[:.]${ADV_PORT}[[:space:]]" \
+  || { echo "FAIL: ttyd not listening on the ADVERTISED port $ADV_PORT (HUD attach link would be dead)"; exit 1; }
+DEADPANE="$(tmux list-panes -t mc-main:Boss -F '#{pane_dead}' 2>/dev/null | head -1)"
+[ "$DEADPANE" = 0 ] || { echo "FAIL: attach target mc-main:Boss is not a LIVE pane (pane_dead='$DEADPANE') — attach would open a blank/dead terminal"; exit 1; }
+echo "attach OK: ttyd on advertised :$ADV_PORT serves a LIVE mc-main:Boss pane (URL opens the live pane)"
 
 # tmux server (started by queue-client) MUST run with UTF-8 locale.
 # If the host default is POSIX, tmux strips multi-byte chars (●, ⏺, ✻,
@@ -3109,11 +3127,49 @@ curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents \
        curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9900/agents | jq -c '.[]|{agent_id,state}' 2>/dev/null || true; exit 1; }
 echo "Boss-in-HUD OK: $HOST_ID/main:Boss alive in /agents (HUD shows a working Boss)"
 
+# ── CEO DONE-CONDITION GATE: add-task on the board -> Boss RECEIVES the ping ──
+# Core value: add-task -> Boss pinged -> Boss works it. A task that only lands on the
+# board (Boss never told) is the exact broken-wiring bug. Run this FIRST, while the
+# Boss is the freshly-onboarded idle one (BEFORE the supervisor-kill test below, which
+# would leave the Boss mid-respawn). Add a REAL (NON-test) task — test tasks are EXEMPT
+# from boss_ping, so a test:true probe never exercises the wiring (the old weak gate's
+# blind spot) — then assert (a) it persists on /todo/board and (b) the ping LANDS in the
+# Boss pane (mc-main:Boss shows the task id). Pane-delivery is the ground truth that the
+# Boss received it; an EMPTY pane is the regression (todo-server without `mp` on PATH ->
+# shutil.which("mp")==None -> boss_ping no-ops). NB: key off pane-delivery, NOT mp-send
+# rc — a busy Boss returns rc=1 while still pasting the ping into its composer.
+curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:9933/ | grep -q '^200$' \
+  || { echo "FAIL: TODO app not serving on :9933"; exit 1; }
+for i in $(seq 1 20); do mp peek "main:Boss" 2>&1 | head -1 | grep -q 'state=IDLE' && break; sleep 2; done
+TODO_MARK="verify-board2boss-$$"
+TODO_ID=$(curl -fsS -H "X-Queue-Secret: $QSECRET" -H 'Content-Type: application/json' \
+  -d "{\"op\":\"add\",\"text\":\"$TODO_MARK\"}" http://127.0.0.1:9933/todo/update | jq -r '.id // empty')
+[ -n "$TODO_ID" ] || { echo "FAIL: TODO add-task POST returned no id (add-task broken)"; exit 1; }
+curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9933/todo/board \
+  | jq -e --arg i "$TODO_ID" '.tasks[$i] != null' >/dev/null \
+  || { echo "FAIL: added task $TODO_ID not on /todo/board (add-task did not persist)"; exit 1; }
+PINGED=0
+for i in $(seq 1 30); do
+  tmux capture-pane -t mc-main:Boss -p -S -220 2>/dev/null | grep -q "$TODO_ID" && { PINGED=1; break; }
+  sleep 2
+done
+if [ "$PINGED" != 1 ]; then
+  echo "FAIL: add-task did NOT reach the Boss — task $TODO_ID is on the board but NO ping reached the Boss pane (mc-main:Boss)."
+  echo "  (boss-inbox.log tail:)"; tail -3 "$INSTALL_DIR/todos/boss-inbox.log" 2>/dev/null || true
+  echo "  Most common cause: todo-server launched without mp on PATH -> shutil.which('mp')==None -> boss_ping no-ops (see Step 9.5)."
+  curl -fsS -H "X-Queue-Secret: $QSECRET" -H 'Content-Type: application/json' -d "{\"op\":\"del\",\"id\":\"$TODO_ID\"}" http://127.0.0.1:9933/todo/update >/dev/null 2>&1 || true
+  exit 1
+fi
+curl -fsS -H "X-Queue-Secret: $QSECRET" -H 'Content-Type: application/json' \
+  -d "{\"op\":\"del\",\"id\":\"$TODO_ID\"}" http://127.0.0.1:9933/todo/update >/dev/null 2>&1 || true
+echo "board->Boss OK: add-task $TODO_ID delivered the ping to the Boss pane (mc-main:Boss)"
+
 # ── CEO DONE-CONDITION GATE: the BOSS SUPERVISOR resurrects a killed Boss ─────
 # "Always 1 Boss up." Prove the supervisor (Step 10.5) auto-restarts the Boss with
 # NO human: the supervisor daemon must be alive, and KILLING the Boss must make it
 # reappear ALIVE in the HUD /agents on its own. (This is the robust fix for the
 # no-Boss-in-HUD false green — not just "don't kill it", but "resurrect it".)
+# Runs LAST among the Boss gates because it deliberately disrupts the live Boss.
 kill -0 "$(cat "$INSTALL_DIR/run/boss-supervisor.pid" 2>/dev/null)" 2>/dev/null \
   || { echo "FAIL: Boss supervisor daemon is not running (run/boss-supervisor.pid)"; exit 1; }
 tmux kill-window -t mc-main:Boss 2>/dev/null || tmux kill-session -t mc-main 2>/dev/null || true
@@ -3126,22 +3182,6 @@ for i in $(seq 1 30); do            # supervisor checks ~every 15s; allow respaw
 done
 [ "$BOSS_BACK" = 1 ] || { echo "FAIL: Boss supervisor did NOT resurrect the killed Boss into the HUD /agents"; exit 1; }
 echo "Boss-supervisor OK: killed the Boss, supervisor auto-respawned it back into the HUD /agents (no human)"
-
-# ── CEO DONE-CONDITION GATE: the TODO app serves AND add-task round-trips ─────
-# TODO app on :9933. Prove a task created through the API (POST /todo/update
-# {op:add}) is read back on /todo/board, then remove the test fixture.
-curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:9933/ | grep -q '^200$' \
-  || { echo "FAIL: TODO app not serving on :9933"; exit 1; }
-TODO_MARK="verify-addtask-$$"
-TODO_ID=$(curl -fsS -H "X-Queue-Secret: $QSECRET" -H 'Content-Type: application/json' \
-  -d "{\"op\":\"add\",\"text\":\"$TODO_MARK\",\"test\":true}" http://127.0.0.1:9933/todo/update | jq -r '.id // empty')
-[ -n "$TODO_ID" ] || { echo "FAIL: TODO add-task POST returned no id (add-task broken)"; exit 1; }
-curl -fsS -H "X-Queue-Secret: $QSECRET" http://127.0.0.1:9933/todo/board \
-  | jq -e --arg i "$TODO_ID" '.tasks[$i] != null' >/dev/null \
-  || { echo "FAIL: added task $TODO_ID not on /todo/board (add-task did not persist)"; exit 1; }
-curl -fsS -H "X-Queue-Secret: $QSECRET" -H 'Content-Type: application/json' \
-  -d "{\"op\":\"del\",\"id\":\"$TODO_ID\"}" http://127.0.0.1:9933/todo/update >/dev/null 2>&1 || true
-echo "TODO add-task OK: created+read-back task $TODO_ID on :9933 (test fixture removed)"
 
 # Cleanup — kill ONLY the ephemeral test workers spawned during Verify. NEVER kill
 # the master Boss: the CEO done-condition requires it to stay LIVE in the HUD.
