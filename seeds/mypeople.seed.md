@@ -183,6 +183,20 @@ every heartbeat so a server restart / false-prune repopulates within one cycle. 
 **5.10 UTF-8 everywhere.** Set `LANG=C.UTF-8`/`LC_ALL=C.UTF-8` for the queue-client/tmux so the
 TUI glyphs (`❯ ● ✻ …`) aren't mangled to underscores.
 
+**5.11 Substrate agents are ALWAYS visible on the CENTRAL grid (never an island).** Every
+substrate MUST keep heartbeating + re-announcing its agents to the **central/upstream** queue
+(`UPSTREAM_QUEUE_URL` + `UPSTREAM_QUEUE_SECRET`, the CEO's fleet HUD) so the node and its agents
+appear on the **central HUD's machines-grid (§7.1)** under the node's `purpose` — **even if the
+node also runs its own local queue-server/HUD/TODO.** This is a SETUP contract, not a feature:
+the prior install-flow build pointed `queue-client` at `127.0.0.1` only, so the node went dark on
+the central grid the instant it self-hosted → invisible on the CEO's HUD (a healthy node that
+silently left the fleet). Concretely: the node **registers/heartbeats to the central queue**
+(advertising `hostname`, the tailnet `attach_base`, `purpose`, `node_type`, `recording_url`, and
+its live agents incl. `main:Boss`); if it ALSO runs a local mypeople, the local queue is for the
+node's own board, but the **central uplink is mandatory and must survive every daemon restart /
+graceful handoff (§5.8) — never drop it.** "I asked for X substrates, I see X on the HUD"
+(§7.1) only works if every node stays on the central grid.
+
 ---
 
 ## 6. The TODO board (state + API + the board→Boss ping)
@@ -299,6 +313,8 @@ A generated build MAY stub these (e.g. `/todo/wa` returns 501) without failing a
 | `TS_AUTHKEY` | yes (tailnet) | — | env | Tailscale auth key for `tailscale up` (§5.6). |
 | `INSTALL_DIR` | no | `$HOME/mypeople` | — | — |
 | `HOST_ID` | no | `$(hostname -s)` | — | Stable node id used in every agent_id. |
+| `UPSTREAM_QUEUE_URL` + `UPSTREAM_QUEUE_SECRET` | yes | — | env / `queue.env` | The CEO's **central** fleet queue (its tailnet IP:9900) + secret. The node uplinks its agents here so they show on the central HUD grid (§5.11). |
+| `NODE_PURPOSE` / `NODE_TYPE` / `NODE_RECORDING_URL` | no | `mypeople` / `system-agent` / `` | env | The node's grid grouping label, type, and seedrec link (§4, §7.1). |
 
 **Step 0 — Interview (mandatory):** detect each; send ONE consolidated message (✓ satisfied / ✗
 needed / ⚠ prior install to confirm), then build autonomously to `SEED_RESULT=DONE` or one
@@ -403,6 +419,13 @@ kill ephemeral test workers.
     (e.g. `POST /heartbeat purpose=mypeople` ×N and `purpose=airbnb` ×M) yields exactly two
     groups whose counts are N and M (e.g. `mypeople hydration · N`). This is the "I asked for X,
     I see X" check — the CEO counts the cards under a hydration's group.
+12. **Substrate visible on the CENTRAL grid (§5.11).** After install, the node + its `main:Boss`
+    appear on the **central/upstream** queue, not just locally: `GET $UPSTREAM_QUEUE_URL/clients`
+    lists this `hostname` (with its `purpose` + tailnet `attach_base`) and
+    `GET $UPSTREAM_QUEUE_URL/agents` lists `<host>/main:Boss` `alive`. Then **restart the node's
+    daemons** and re-assert it's STILL on the central grid within one heartbeat (it must not go
+    dark when self-hosting). A node that serves its own HUD/TODO but is absent from the central
+    `/clients`+`/agents` = the island regression ⇒ FAIL.
 
 ---
 
