@@ -90,10 +90,12 @@ requires header `X-Queue-Secret: <QUEUE_SECRET>`; JSON bodies):
 - `POST /agents/register` `{agent_id, backend, state, boss_id, is_master}`; `POST
   /agents/unregister` `{agent_id}`.
 - `POST /heartbeat` `{hostname, attach_base, substrate_ready, purpose, node_type,
-  recording_url}` → liveness + the host's re-announced agents. **`attach_base` contract: see
-  §5.2.** `purpose`/`node_type`/`recording_url` are read from the node's config
+  recording_url, state}` → liveness + the host's re-announced agents. **`attach_base` contract:
+  see §5.2.** `purpose`/`node_type`/`recording_url` are read from the node's config
   (`NODE_PURPOSE` / `NODE_TYPE` / `NODE_RECORDING_URL` in `queue.env`; `purpose` defaults to
-  `mypeople`, `node_type` to `system-agent`) and surface in `/clients` for the §7.1 grid.
+  `mypeople`, `node_type` to `system-agent`). **`state` ∈ {`hydrating`,`ready`,`failed`}** is the
+  node's hydration lifecycle (§5.11) — `hydrating` from bring-up, `ready` once the inner Verify
+  passes. All surface in `/clients` for the §7.1 grid (which shows each node's `state`).
 - `POST /task/submit` `{type(send|peek|kill|spawn|answer|revive), target_agent, payload}` →
   `{task_id}`; `GET /task/poll?hostname=<h>` (clients long/short-poll their tasks); `POST
   /task/result` `{task_id, ok, result}`; `GET /task/<id>` → task status+result (submitters wait
@@ -186,14 +188,22 @@ TUI glyphs (`❯ ● ✻ …`) aren't mangled to underscores.
 **5.11 TWO ISOLATED PLANES — the node is ALWAYS visible on the central grid (never an island).**
 A substrate runs **two mypeople setups that must not touch each other:**
 
-- **OUTER — fleet uplink (JOIN).** A thin queue-client in its **OWN dir + config**
+- **OUTER — fleet uplink (JOIN), UPLINK-FIRST.** A thin queue-client in its **OWN dir + config**
   (`$UPLINK_DIR`, default `$HOME/mypeople-uplink`; config `~/.config/mypeople/upstream.env`) that
   **only connects OUT** to the central queue (`UPSTREAM_QUEUE_URL` + `UPSTREAM_QUEUE_SECRET`) —
-  it **binds NO local ports** and runs **no** local queue-server. It heartbeats the node
-  (advertising `hostname`, tailnet `attach_base`, `purpose`, `node_type`, `recording_url`) and
-  **re-announces the node's live agents — including the INNER product's `main:Boss`** — to the
-  central queue, so the node + its Boss show on the **central HUD machines-grid (§7.1)**. This is
-  the plane the install **engineer** lives on and the CEO watches.
+  it **binds NO local ports** and runs **no** local queue-server.
+  **It MUST start FIRST — the very first action of the build (Step 1), BEFORE OS-deps / before
+  generating the inner product / before the inner is up** — and register the node immediately
+  with **`state=hydrating`** + `purpose` (and `hostname`, tailnet `attach_base` when available,
+  `node_type`). It heartbeats **throughout** the whole hydration and **re-announces the node's
+  live agents — including the INNER product's `main:Boss` once spawned**, so the node + its Boss
+  show on the **central HUD machines-grid (§7.1)**. **State lifecycle:** `hydrating` (from
+  bring-up, while generating/installing) → **`ready`** (only when the inner `## Verify` passes) →
+  or **`failed`** (on a blocker). **WHY uplink-first:** the CEO must SEE "N substrates hydrating"
+  *while* they hydrate — a node must appear on the grid **the moment it starts**, not ~minutes
+  later when its inner finishes. (Gap that forced this: the uplink started late → a node was
+  invisible on the hub for the entire ~build, so 5 generating nodes showed as 1.) This is the
+  plane the install **engineer** lives on and the CEO watches from the first second.
 - **INNER — the product (self-contained).** The mypeople the agent installs: its own
   queue-server/HUD/TODO/Boss in `$INSTALL_DIR` (`$HOME/mypeople`), owning the **local ports
   9900/9933/7681**, queue.env → `127.0.0.1`.
@@ -260,8 +270,9 @@ a **grid of every machine/container connected to the grid** (one card per `/clie
 total**. The grouping + counts are the whole point: the CEO asks for X substrates of a hydration
 and visually confirms exactly X cards under that group. Each node card shows: **type**
 (`node_type`: one-shot eng / long-lived eng / always-running system agent / in-substrate install
-eng), **machine** (`hostname`), **state** (alive/dead from liveness; Volt when alive), an
-**attach link** (`<attach_base>/?arg=-t&arg=mc-main:Boss`, or the node's primary agent), and the
+eng), **machine** (`hostname`), **state** — the hydration lifecycle **`hydrating`** (Volt/pulsing,
+inner not up yet) / **`ready`** (inner Verify passed) / **`failed`**, plus alive/dead liveness —
+so the CEO sees nodes appear as **hydrating the moment they start**, an **attach link** (`<attach_base>/?arg=-t&arg=mc-main:Boss`, or the node's primary agent), and the
 **seedrec recording link** (`recording_url`, shown only when present). Counts are derived live
 from `/clients` (group by `purpose`, count members) — they update as nodes join/leave.
 
@@ -359,25 +370,30 @@ Author each from §3–§8. They interoperate because you write them together to
 
 Bare host (shell + authed `claude`). State intent; adapt commands to the host.
 0. **Interview** (§10).
-1. **OS deps.** Ensure `python3, jq, procps(ps), curl, tmux, ttyd, tailscale` — install the
+1. **UPLINK-FIRST (§5.11) — do this BEFORE anything else.** Generate the small outer fleet-uplink
+   and **start it immediately** in `$UPLINK_DIR` (own config from `~/.config/mypeople/upstream.env`,
+   no local ports), registering the node to `UPSTREAM_QUEUE_URL` with **`state=hydrating`** +
+   `purpose`/`node_type`/`hostname` (enrich `attach_base` once the tailnet is up in Step 5). It
+   heartbeats throughout. **The node MUST appear on the central hub grid now — before OS-deps,
+   before the inner is built** — so the CEO sees it hydrating from the first second. Keep it
+   isolated (nothing below may stop/rewrite it).
+2. **OS deps.** Ensure `python3, jq, procps(ps), curl, tmux, ttyd, tailscale` — install the
    missing ones (apt / `ttyd` release binary / `tailscale` install script). (On a clean base
    `jq/procps/ttyd/tailscale` ARE missing — install them for real; do not assume.)
-2. **Layout + config.** Create `$INSTALL_DIR/{bin,run,status,todos,plugins}`; write
+3. **Layout + config.** Create `$INSTALL_DIR/{bin,run,status,todos,plugins}`; write
    `~/.config/mypeople/queue.env` (`QUEUE_SECRET` auto-gen if unset, ports, `HOST_ID`,
    `LANG/LC_ALL=C.UTF-8`); set `hasCompletedOnboarding:true` in `~/.claude.json` (§5.5).
-3. **GENERATE the components** (§11) from the spec — write the code now, to the §4–§8 contracts.
-4. **Tailnet** (§5.6): userland `tailscaled` + `tailscale up` + default-socket symlink; capture
-   the `100.x` IP for `attach_base`.
-5. **Start daemons** (§5.8): `queue-server` (wait `/health`), `queue-client` (heartbeat with the
-   tailnet `attach_base`), **`ttyd` (§5.7)**, **`todo-server` with `mp` on PATH (§5.1)**.
-6. **Spawn the Boss** (`mp spawn <host>/main:Boss --master`), wait for its onboarded summary,
-   then **start the Boss supervisor** (§5.3).
-7. **Start the OUTER fleet-uplink (§5.11)** — in its own `$UPLINK_DIR`/config, connecting OUT to
-   `UPSTREAM_QUEUE_URL` (no local ports), heartbeating the node (`purpose`/`node_type`/tailnet
-   `attach_base`/`recording_url`) and re-announcing the inner `main:Boss`. Confirm the node +
-   Boss appear on `$UPSTREAM_QUEUE_URL/clients`+`/agents`. **Keep it isolated** — nothing in the
-   inner install (Steps 1–6) may stop/rewrite it.
+4. **GENERATE the components** (§11) from the spec — write the code now, to the §4–§8 contracts.
+5. **Tailnet** (§5.6): userland `tailscaled` + `tailscale up` + default-socket symlink; capture
+   the `100.x` IP — the uplink's `attach_base` updates to it on the next heartbeat.
+6. **Start INNER daemons** (§5.8): `queue-server` (wait `/health`), `queue-client` (heartbeat with
+   the tailnet `attach_base`), **`ttyd` (§5.7)**, **`todo-server` with `mp` on PATH (§5.1)**.
+7. **Spawn the Boss** (`mp spawn <host>/main:Boss --master`), wait for its onboarded summary,
+   then **start the Boss supervisor** (§5.3). The outer uplink (Step 1) re-announces the Boss.
 8. **Verify** (§14) — exit code is the truth.
+9. **Flip the uplink state** `hydrating`→**`ready`** when Verify passes (or `failed` on a blocker).
+   Confirm the node + Boss show on `$UPSTREAM_QUEUE_URL/clients`+`/agents` as `ready`. Keep the
+   uplink up for the node's life.
 
 ---
 
@@ -452,6 +468,13 @@ kill ephemeral test workers.
     of stopping or re-pointing the outer uplink. A node serving its own HUD/TODO but absent from
     the central `/clients`+`/agents` (or whose outer uplink died when the inner restarted) = the
     island regression ⇒ FAIL.
+13. **Uplink-FIRST hydration visibility (§5.11).** The node must appear on the central hub grid
+    as **`hydrating` BEFORE its inner is up** — so the CEO sees it the moment it starts. *Assert:*
+    the outer uplink started first (its pidfile/first heartbeat predates the inner queue-server's
+    start; equivalently, during a fresh bring-up the node shows on `$UPSTREAM_QUEUE_URL/clients`
+    with `state=hydrating` while `:9900` is still down), and after install it shows `state=ready`.
+    A node that only appears on the hub AFTER its inner is up = the uplink-late regression ⇒ FAIL.
+    (N substrates must show as `hydrating` on the grid concurrently while they build — not 1.)
 
 ---
 
