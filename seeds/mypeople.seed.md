@@ -183,19 +183,30 @@ every heartbeat so a server restart / false-prune repopulates within one cycle. 
 **5.10 UTF-8 everywhere.** Set `LANG=C.UTF-8`/`LC_ALL=C.UTF-8` for the queue-client/tmux so the
 TUI glyphs (`❯ ● ✻ …`) aren't mangled to underscores.
 
-**5.11 Substrate agents are ALWAYS visible on the CENTRAL grid (never an island).** Every
-substrate MUST keep heartbeating + re-announcing its agents to the **central/upstream** queue
-(`UPSTREAM_QUEUE_URL` + `UPSTREAM_QUEUE_SECRET`, the CEO's fleet HUD) so the node and its agents
-appear on the **central HUD's machines-grid (§7.1)** under the node's `purpose` — **even if the
-node also runs its own local queue-server/HUD/TODO.** This is a SETUP contract, not a feature:
-the prior install-flow build pointed `queue-client` at `127.0.0.1` only, so the node went dark on
-the central grid the instant it self-hosted → invisible on the CEO's HUD (a healthy node that
-silently left the fleet). Concretely: the node **registers/heartbeats to the central queue**
-(advertising `hostname`, the tailnet `attach_base`, `purpose`, `node_type`, `recording_url`, and
-its live agents incl. `main:Boss`); if it ALSO runs a local mypeople, the local queue is for the
-node's own board, but the **central uplink is mandatory and must survive every daemon restart /
-graceful handoff (§5.8) — never drop it.** "I asked for X substrates, I see X on the HUD"
-(§7.1) only works if every node stays on the central grid.
+**5.11 TWO ISOLATED PLANES — the node is ALWAYS visible on the central grid (never an island).**
+A substrate runs **two mypeople setups that must not touch each other:**
+
+- **OUTER — fleet uplink (JOIN).** A thin queue-client in its **OWN dir + config**
+  (`$UPLINK_DIR`, default `$HOME/mypeople-uplink`; config `~/.config/mypeople/upstream.env`) that
+  **only connects OUT** to the central queue (`UPSTREAM_QUEUE_URL` + `UPSTREAM_QUEUE_SECRET`) —
+  it **binds NO local ports** and runs **no** local queue-server. It heartbeats the node
+  (advertising `hostname`, tailnet `attach_base`, `purpose`, `node_type`, `recording_url`) and
+  **re-announces the node's live agents — including the INNER product's `main:Boss`** — to the
+  central queue, so the node + its Boss show on the **central HUD machines-grid (§7.1)**. This is
+  the plane the install **engineer** lives on and the CEO watches.
+- **INNER — the product (self-contained).** The mypeople the agent installs: its own
+  queue-server/HUD/TODO/Boss in `$INSTALL_DIR` (`$HOME/mypeople`), owning the **local ports
+  9900/9933/7681**, queue.env → `127.0.0.1`.
+
+**Isolation contract (this is the whole point — the prior bug was the planes shared state):**
+the two planes have **separate dirs, configs, pidfiles, and queue.env files**; the OUTER binds
+no ports (so no port clash) and the INNER's lifecycle (Step 2 daemon-stops, Step 8 queue.env
+rewrite, Step 9 graceful handoff, §5.8) **may only touch INNER state — never the OUTER uplink.**
+Installing/restarting the inner product must be **incapable** of stopping, rewriting, or
+re-pointing the outer uplink. Result: the node **never goes dark on the central grid** while it
+self-hosts. (Root cause of the defect: the install-flow reused ONE `queue.env`/queue-client/dir/
+ports for both, so installing the inner clobbered the outer JOIN → the node vanished from the
+CEO's HUD.) "I asked for X substrates, I see X" (§7.1) depends on this isolation holding.
 
 ---
 
@@ -315,6 +326,7 @@ A generated build MAY stub these (e.g. `/todo/wa` returns 501) without failing a
 | `HOST_ID` | no | `$(hostname -s)` | — | Stable node id used in every agent_id. |
 | `UPSTREAM_QUEUE_URL` + `UPSTREAM_QUEUE_SECRET` | yes | — | env / `queue.env` | The CEO's **central** fleet queue (its tailnet IP:9900) + secret. The node uplinks its agents here so they show on the central HUD grid (§5.11). |
 | `NODE_PURPOSE` / `NODE_TYPE` / `NODE_RECORDING_URL` | no | `mypeople` / `system-agent` / `` | env | The node's grid grouping label, type, and seedrec link (§4, §7.1). |
+| `UPLINK_DIR` | no | `$HOME/mypeople-uplink` | — | Own dir for the OUTER fleet-uplink (§5.11) — isolated from `$INSTALL_DIR` so the inner install can't touch it. |
 
 **Step 0 — Interview (mandatory):** detect each; send ONE consolidated message (✓ satisfied / ✗
 needed / ⚠ prior install to confirm), then build autonomously to `SEED_RESULT=DONE` or one
@@ -327,7 +339,11 @@ needed / ⚠ prior install to confirm), then build autonomously to `SEED_RESULT=
 Author each from §3–§8. They interoperate because you write them together to the §4 contracts.
 - `bin/queue-server.py` — the HTTP queue + registry + reaper + `/dashboard` + `/roster` (§4,§5.9).
 - `bin/queue-client.py` — heartbeat (with tailnet `attach_base`, §5.2), agent re-announce,
-  task poll→tmux relay, durable roster/agents (§3).
+  task poll→tmux relay, durable roster/agents (§3). **INNER plane** (→ local queue-server).
+- **OUTER fleet-uplink (§5.11)** — a thin client in `$UPLINK_DIR` (own config/pidfile, **no
+  local ports**) that connects OUT to the central queue and re-announces the node + the inner
+  `main:Boss`. (May reuse the queue-client code pointed at `UPSTREAM_QUEUE_URL`, but fully
+  isolated from the inner: separate dir, config, pidfile — the inner's lifecycle never touches it.)
 - `bin/mp` — the CLI (§4 verbs), incl. idempotent spawn + the §4 tmux mapping.
 - `bin/todo-server.py` + `bin/todos.html` — the TODO board + API + board→Boss ping (§6) + PLOW
   identity + cross-nav + click-to-terminal (§7).
@@ -356,7 +372,12 @@ Bare host (shell + authed `claude`). State intent; adapt commands to the host.
    tailnet `attach_base`), **`ttyd` (§5.7)**, **`todo-server` with `mp` on PATH (§5.1)**.
 6. **Spawn the Boss** (`mp spawn <host>/main:Boss --master`), wait for its onboarded summary,
    then **start the Boss supervisor** (§5.3).
-7. **Verify** (§14) — exit code is the truth.
+7. **Start the OUTER fleet-uplink (§5.11)** — in its own `$UPLINK_DIR`/config, connecting OUT to
+   `UPSTREAM_QUEUE_URL` (no local ports), heartbeating the node (`purpose`/`node_type`/tailnet
+   `attach_base`/`recording_url`) and re-announcing the inner `main:Boss`. Confirm the node +
+   Boss appear on `$UPSTREAM_QUEUE_URL/clients`+`/agents`. **Keep it isolated** — nothing in the
+   inner install (Steps 1–6) may stop/rewrite it.
+8. **Verify** (§14) — exit code is the truth.
 
 ---
 
@@ -419,13 +440,18 @@ kill ephemeral test workers.
     (e.g. `POST /heartbeat purpose=mypeople` ×N and `purpose=airbnb` ×M) yields exactly two
     groups whose counts are N and M (e.g. `mypeople hydration · N`). This is the "I asked for X,
     I see X" check — the CEO counts the cards under a hydration's group.
-12. **Substrate visible on the CENTRAL grid (§5.11).** After install, the node + its `main:Boss`
-    appear on the **central/upstream** queue, not just locally: `GET $UPSTREAM_QUEUE_URL/clients`
-    lists this `hostname` (with its `purpose` + tailnet `attach_base`) and
-    `GET $UPSTREAM_QUEUE_URL/agents` lists `<host>/main:Boss` `alive`. Then **restart the node's
-    daemons** and re-assert it's STILL on the central grid within one heartbeat (it must not go
-    dark when self-hosting). A node that serves its own HUD/TODO but is absent from the central
-    `/clients`+`/agents` = the island regression ⇒ FAIL.
+12. **Two-plane isolation — inner install never knocks the node off the central grid (§5.11).**
+    Prove the OUTER uplink and INNER product are isolated and the node stays visible:
+    (a) `GET $UPSTREAM_QUEUE_URL/clients` lists this `hostname` (with `purpose` + tailnet
+    `attach_base`) and `GET $UPSTREAM_QUEUE_URL/agents` lists `<host>/main:Boss` `alive` — i.e.
+    the node + its INNER Boss show on the **central** grid, not just locally;
+    (b) the OUTER uplink runs from `$UPLINK_DIR` (separate dir/config/pidfile from `$INSTALL_DIR`)
+    and binds **no** local ports;
+    (c) **re-run the INNER install AND restart the inner daemons (queue-server/client/ttyd/todo),
+    then re-assert (a) still holds within one heartbeat** — the inner lifecycle must be incapable
+    of stopping or re-pointing the outer uplink. A node serving its own HUD/TODO but absent from
+    the central `/clients`+`/agents` (or whose outer uplink died when the inner restarted) = the
+    island regression ⇒ FAIL.
 
 ---
 
