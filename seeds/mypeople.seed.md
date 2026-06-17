@@ -2253,26 +2253,36 @@ else
 cat > "$INSTALL_DIR/bin/dashboard.html" <<'HTML_EOF'
 <!doctype html>
 <html><head><meta charset="utf-8"><title>mypeople — HUD</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 <style>
-  body { font: 14px -apple-system,system-ui; margin: 24px; background: #f4f4f4; color: #111; }
-  h1 { margin: 0 0 12px; font-size: 20px; }
-  .meta { color: #666; font-size: 12px; margin-bottom: 12px; }
-  table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }
-  th, td { padding: 8px 10px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
-  th { background: #f6f6f6; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #666; }
-  tr:last-child td { border-bottom: 0; }
-  .alive { color: #1e6e2c; font-weight: 600; }
-  .dead, .gone { color: #a52a2a; font-weight: 600; }
-  code { background: #f1f1f1; padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
-  a { color: #1f6feb; text-decoration: none; font-weight: 600; }
-  .summary { color: #444; }
-  h2 { margin: 28px 0 10px; font-size: 15px; color: #333; }
-  .cmd { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #333; white-space: pre-wrap; word-break: break-all; max-width: 360px; display: inline-block; }
-  .reason { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #8a5a00; font-weight: 600; }
-  button.revive { background: #1e6e2c; color: #fff; border: 0; border-radius: 4px; padding: 5px 12px; font-weight: 600; cursor: pointer; font-size: 12px; }
-  button.revive:hover { background: #18581f; }
-  .noresume { display: inline-block; background: #fce8e6; color: #a52a2a; border: 1px solid #f0b3ad; border-radius: 4px; padding: 4px 9px; font-size: 11px; font-weight: 600; }
-  .card-link { font-size: 11px; }
+  /* PLOW visual identity — Plow Design System v2.0 (dark product UI: audit/terminal aesthetic) */
+  :root{ --midnight:#01000A; --volt:#D5EF8A; --grove:#5E7A5E; --iris:#C4BFFF;
+    --dark-bg:#111110; --dark-card:#1A1A18; --text-dark:#F0F0E8; --muted-dark:rgba(240,240,232,0.45);
+    --surface:rgba(255,255,255,0.05); --surface2:rgba(255,255,255,0.08); --border-dark:rgba(255,255,255,0.09);
+    --volt-glow:rgba(213,239,138,0.25); --danger:#FF3B30; --warning:#FEBC2E;
+    --serif:'Instrument Serif',Georgia,serif; --sans:'DM Sans',system-ui,-apple-system,sans-serif; --mono:'DM Mono','SF Mono',Consolas,monospace; }
+  *{box-sizing:border-box}
+  body { font:300 14px/1.6 var(--sans); margin:28px; background:var(--dark-bg); color:var(--text-dark); }
+  h1 { margin:0 0 4px; font:400 30px/1.05 var(--serif); letter-spacing:-0.015em; color:var(--text-dark); }
+  h2 { margin:30px 0 12px; font:400 22px/1.1 var(--serif); color:var(--text-dark); }
+  .meta { color:var(--muted-dark); font:500 12px/1 var(--mono); letter-spacing:0.06em; text-transform:uppercase; margin-bottom:18px; }
+  table { width:100%; border-collapse:separate; border-spacing:0; background:var(--surface); border:1px solid var(--border-dark); border-radius:12px; overflow:hidden; }
+  th, td { padding:10px 12px; border-bottom:1px solid var(--border-dark); text-align:left; vertical-align:top; }
+  th { background:var(--surface2); font:500 11px/1 var(--mono); text-transform:uppercase; letter-spacing:0.08em; color:var(--muted-dark); }
+  tr:last-child td { border-bottom:0; }
+  tr:hover td { background:rgba(255,255,255,0.03); }
+  .alive { color:var(--volt); font-weight:600; }
+  .dead, .gone { color:var(--danger); font-weight:600; }
+  code { background:var(--surface); border:1px solid var(--border-dark); padding:1px 6px; border-radius:6px; font-family:var(--mono); font-size:12px; color:var(--text-dark); }
+  a { color:var(--volt); text-decoration:none; font-weight:600; border-bottom:1px dotted rgba(213,239,138,0.5); }
+  a:hover { border-bottom-color:var(--volt); }
+  .summary { color:rgba(240,240,232,0.7); font-weight:300; }
+  .cmd { font-family:var(--mono); font-size:11px; color:rgba(240,240,232,0.7); white-space:pre-wrap; word-break:break-all; max-width:360px; display:inline-block; }
+  .reason { font:500 11px/1 var(--mono); text-transform:uppercase; letter-spacing:.06em; color:var(--warning); }
+  button.revive { background:var(--volt); color:var(--midnight); border:0; border-radius:10px; padding:6px 14px; font:700 12px var(--sans); cursor:pointer; }
+  button.revive:hover { transform:translateY(-1px); box-shadow:0 4px 20px var(--volt-glow),0 0 30px var(--volt-glow); }
+  .noresume { display:inline-block; background:rgba(255,59,48,0.10); color:#FF6961; border:1px solid rgba(255,59,48,0.22); border-radius:8px; padding:4px 9px; font:600 11px var(--sans); }
+  .card-link { font-size:11px; }
 </style></head>
 <body>
 <h1>mypeople — HUD <a href="#" onclick="window.open('http://'+location.hostname+':9933/','_blank','noopener');return false;" title="Open the MyPeople TODO board" style="font-size:13px;font-weight:400;color:#D5EF8A;text-decoration:none;border-bottom:1px dotted #D5EF8A;margin-left:10px">TODO ↗</a></h1>
@@ -3203,6 +3213,17 @@ ATTACH_JSON=$(curl -fsS -H "X-Queue-Secret: $QSECRET" "http://127.0.0.1:9933/tod
 echo "$ATTACH_JSON" | jq -e '.ok==true and (.target|test("^mc-.+:.+"))' >/dev/null \
   || { echo "FAIL: /todo/attach did not resolve $HOST_ID/main:Boss to a ttyd target: $ATTACH_JSON"; exit 1; }
 echo "click-to-terminal OK: comment-author attach wired + /todo/attach resolves agent_id -> $(echo "$ATTACH_JSON" | jq -r .target)"
+
+# ── ITEM 1 GATE: PLOW visual identity on BOTH TODO and HUD ────────────────────
+# MyPeople shares Plow's brand identity (Plow Design System v2.0): both pages must
+# carry the Plow tokens — Volt (#D5EF8A) + the Plow typefaces (Instrument Serif /
+# DM Sans / DM Mono). Source: plow.co/STYLE-GUIDE.md in the Plow repo.
+for u in "http://127.0.0.1:9933/" "http://127.0.0.1:9900/dashboard"; do
+  PG=$(curl -fsS "$u")
+  printf '%s' "$PG" | grep -qi 'D5EF8A' || { echo "FAIL: $u missing Plow Volt (#D5EF8A) — not on Plow identity"; exit 1; }
+  printf '%s' "$PG" | grep -qE 'Instrument Serif|DM Sans|DM Mono' || { echo "FAIL: $u missing Plow typography (Instrument Serif/DM Sans/DM Mono)"; exit 1; }
+done
+echo "plow-identity OK: TODO + HUD both carry Plow Volt + Plow fonts (Instrument Serif/DM Sans/DM Mono)"
 
 # Cleanup — kill ONLY the ephemeral test workers spawned during Verify. NEVER kill
 # the master Boss: the CEO done-condition requires it to stay LIVE in the HUD.
