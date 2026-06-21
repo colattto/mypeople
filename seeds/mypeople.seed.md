@@ -549,9 +549,13 @@ down-arrow button, e.g. `↓`, anchored bottom-right of the SCROLLABLE thread ar
 - On click it **smooth-scrolls to the newest comment** (`thread.scrollTo({top: scrollHeight,
   behavior:'smooth'})` or `lastComment.scrollIntoView({behavior:'smooth'})`), then hides itself once
   the bottom is reached.
-- On opening a card the thread starts scrolled to the bottom (newest visible), so the button is
-  hidden initially; it appears the moment the user scrolls up. The button is a real wired control
-  (J31 — no dead buttons, zero console errors). **Quality bar:** no broken layout, **zero console errors**, every control wired to a
+- 🔴 **On opening a card, IMMEDIATELY scroll the thread to the bottom** (after the comments render,
+  set `threadMsgs.scrollTop = threadMsgs.scrollHeight` — do this in the card-open handler, NOT only
+  in the live-update path). The newest comment is visible and the button is hidden initially; it
+  appears the moment the user scrolls up. (Common miss: implementing the keep-at-bottom-on-new-comment
+  logic but forgetting to scroll to bottom on the initial open — then a long thread opens at the TOP
+  with the button already showing. The open handler MUST force the scroll.) The button is a real
+  wired control (J31 — no dead buttons, zero console errors). **Quality bar:** no broken layout, **zero console errors**, every control wired to a
 real endpoint (no dead buttons) — browser-QA (J31) fails on console errors or a non-functional
 control. Reference for *quality/feature-completeness* (NOT for pixel-copy): the production board at
 `127.0.0.1:9933`.
