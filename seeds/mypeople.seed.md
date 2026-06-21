@@ -539,7 +539,19 @@ state "Unpin one first — max 5"), matching the server's `pin_limit` rejection.
 reload (re-fetch `/todo/board`). Clicking a card opens a **card modal** with: the done-condition and the **comment
 thread** (author + body + timestamp, newest last) with a **composer** to post a comment (NO
 brainstorm block — removed). Filter/sort controls and live counts
-are welcome. **Quality bar:** no broken layout, **zero console errors**, every control wired to a
+are welcome.
+🔴 **§7.4 JUMP-TO-LATEST in the comment thread (CEO 2026-06-21).** When a card's comment thread is
+long enough to scroll, the modal MUST show a **floating "jump to latest" control** (a small
+down-arrow button, e.g. `↓`, anchored bottom-right of the SCROLLABLE thread area). Behavior:
+- It is **HIDDEN when the thread is already at the bottom** (within a small threshold, ~24px of the
+  scroll end) and **APPEARS only when the user is scrolled UP** from the bottom — wire it to the
+  thread container's `scroll` event (toggle on `scrollHeight - scrollTop - clientHeight > threshold`).
+- On click it **smooth-scrolls to the newest comment** (`thread.scrollTo({top: scrollHeight,
+  behavior:'smooth'})` or `lastComment.scrollIntoView({behavior:'smooth'})`), then hides itself once
+  the bottom is reached.
+- On opening a card the thread starts scrolled to the bottom (newest visible), so the button is
+  hidden initially; it appears the moment the user scrolls up. The button is a real wired control
+  (J31 — no dead buttons, zero console errors). **Quality bar:** no broken layout, **zero console errors**, every control wired to a
 real endpoint (no dead buttons) — browser-QA (J31) fails on console errors or a non-functional
 control. Reference for *quality/feature-completeness* (NOT for pixel-copy): the production board at
 `127.0.0.1:9933`.
@@ -1003,8 +1015,17 @@ kill ephemeral test workers.
     `/todo/board` after a restart and the pinned set + order are unchanged. (f) **UI affordance:** the
     rendered page has a per-card ★ control and a distinct pinned group at top. Any of: pin not on top,
     wrong pin order, a 6th pin accepted, unpin not restoring, or pins lost on reload/restart = FAIL.
+38. **JUMP-TO-LATEST in the comment thread (§7.4, CEO 2026-06-21).** In a real browser: open a card
+    and post enough comments that the thread overflows its scroll area (≥~15 comments). Then assert:
+    (a) with the thread scrolled to the bottom, the floating jump-to-latest button (↓) is **HIDDEN**;
+    (b) scroll the thread UP → the button **APPEARS**; (c) click it → the thread **smooth-scrolls to
+    the newest comment** (bottom) and the button **hides again** once at the bottom. Verify via the
+    rendered DOM: the button element exists, its visibility toggles with the thread's scroll position
+    (`scrollHeight - scrollTop - clientHeight`), and after click `scrollTop` is at the bottom. A
+    button that never appears, never hides, doesn't scroll to the latest comment, or throws in console
+    = FAIL.
 
-> Gates J14–J37 are NON-OPTIONAL (CEO 2026-06): the Verify harness MUST assert every one. A
+> Gates J14–J38 are NON-OPTIONAL (CEO 2026-06): the Verify harness MUST assert every one. A
 > green run with any F-feature unexercised — OR that leaves ANY test fixture / placeholder host on
 > the live grid, runs default tmux, shows ANY animation, leaks the secret to the browser, fails the
 > joke-protocol E2E loop, needs a manual refresh, steals focus/caret on poll, **or hangs on a
@@ -1132,6 +1153,7 @@ that passes every gate is correct, per Decision B.)
 | F21 | retired engineers + Revive button | `/roster` carries `retired`; `POST /revive{agent_id}` works | J25 |
 | F22 | ITEM 2 — cross-nav TODO ↗ + live/stale pill + agent count | static link to `:9933`; count from `/agents` | J6 |
 | F23 | PIN tasks (WhatsApp-starred, §7.3) — ★ pin/unpin, pinned float to top in pin order, MAX 5, unpin restores, persists | `update{op:'pin'\|'unpin',id}`; `pinned`+`pinRank` in `board.v2.json`; board renders pinned-first by `pinRank` | J37 |
+| F24 | jump-to-latest in comment thread (§7.4) — floating ↓ button, appears when scrolled up, smooth-scrolls to newest, hides at bottom | client-only: thread `scroll` handler toggles the button; click → `scrollTo({top:scrollHeight,behavior:'smooth'})` | J38 |
 
 **§A.3 How the UI is verified now (Decision B — behavioral, NOT checksum).** There is **no
 byte-identity / sha256 gate**. The generated UI is correct when: it carries the PLOW tokens (J9 —
