@@ -64,15 +64,26 @@ live terminal.
   This mapping is a hard contract — the HUD attach link, `mp peek/send`, and the supervisor all
   rely on it.
 - **Registry (in queue-server, in-memory):** clients (hosts) and agents. Each agent record:
-  `{agent_id, host, session, tab, backend, state(alive|dead), boss_id, summary, ts, tmux_target}`.
+  `{agent_id, host, session, tab, backend, state(alive|dead), boss_id, summary, ts, tmux_target,
+  attach_base, attach_url}`.
+  - 🔴 **`/agents` MUST join the attach onto every row server-side** — do NOT make the HUD do the
+    join. When the server builds the `/agents` response it looks up the owning client by `host`
+    and copies that client's `attach_base` onto the agent record, AND emits a ready-built
+    `attach_url = "<attach_base>/?arg=-t&arg=<tmux_target>"` (empty string only if the owning
+    client has no `attach_base` yet). The HUD then renders the per-row ATTACH button directly from
+    `attach_url` — no client-side lookup, no broken/empty cell for a live agent whose host is
+    heartbeating. (Root cause of the empty-ATTACH-cell bug: `attach_base` lived only on `/clients`,
+    never joined to the agent row, so the HUD had nothing to build the link from.)
 - **Durability:** the registry is in-memory; each `queue-client` owns a **durable roster**
   (`run/roster.json`, every agent it ever spawned + spawn cmd + cwd + session-id + retire state)
   and an **agents.json** of currently-live ones, and **re-announces** them on every heartbeat —
   so a queue-server restart (or a reaper false-prune) **self-heals** within one heartbeat cycle.
 - **Status files:** `status/mc-<sess>/<tab>.json` = `{status(idle|busy|blocked), summary,
   timestamp, session_id, boss_id, backend, state}`. The HUD/`/agents` merges `summary` in.
-- **TODO board store:** `todos/board.v2.json` = `{version, order:[taskId…], tasks:{taskId:{id,
-  text, state, assignee, comments:[{id,by,kind,body,ts}], …}}}`.
+- **TODO board store:** `todos/board.v2.json` = `{version, order:[taskId…], pinSeq:<int>,
+  tasks:{taskId:{id, text, state, assignee, pinned:<bool>, pinRank:<int|null>,
+  comments:[{id,by,kind,body,ts}], …}}}`. `pinned`/`pinRank` (§7.3 PINNING) persist here like every
+  other field; `pinSeq` is the board-level monotonic counter that hands out pin ranks.
 
 ---
 
@@ -101,8 +112,9 @@ requires header `X-Queue-Secret: <QUEUE_SECRET>`; JSON bodies):
   /task/result` `{task_id, ok, result}`; `GET /task/<id>` → task status+result (submitters wait
   on this).
 - `GET /roster` → JSON array (retired/known engineers, for the HUD revive table).
-- `GET /dashboard` → the HUD HTML (**public**, no secret) with `__INJECT_SECRET__` replaced by
-  the live secret so its JS can call the gated endpoints.
+- `GET /dashboard` → the HUD HTML (**public**). **The page carries NO secret (§5.12).** Serving it
+  mints a browser session (httpOnly cookie); its same-origin JS calls the gated endpoints with the
+  cookie auto-sent — the QUEUE_SECRET never reaches the browser.
 
 **`mp` CLI** (in `$INSTALL_DIR/bin/mp`, on `PATH`): verbs `status, spawn, send, peek, kill,
 answer, revive`.
@@ -110,6 +122,52 @@ answer, revive`.
   the tmux window `mc-<sess>:<tab>`, launches the backend, registers the agent. `--master` also
   sends the Boss its onboarding prompt (read `boss-CLAUDE.md`). **Idempotent:** spawning an
   agent_id whose window already exists reuses it, never double-launches.
+  - 🔴 **The tmux window MUST be NAMED exactly `<tab>` and that name MUST STICK** — the attach URL
+    the HUD/TODO build is `…/?arg=-t&arg=mc-<sess>:<tab>`, i.e. `tmux attach -t mc-<sess>:<tab>`
+    resolves the window **by name**. Two ways this silently breaks (both are PRODUCT bugs, not
+    host quirks):
+    1. **Not naming it.** `tmux new-session -d -s mc-<sess>` / `new-window -t mc-<sess>` without
+       `-n <tab>` gives the window a default name → `attach -t mc-<sess>:<tab>` →
+       `can't find window: <tab>`. ⇒ ALWAYS pass `-n <tab>` (`new-session -d -s mc-<sess> -n <tab> …`
+       for the first/`--master` window; `new-window -t mc-<sess> -n <tab> …` for the rest).
+    2. **tmux auto-renaming it.** tmux's `automatic-rename`/`allow-rename` is **ON by default**, so
+       the moment the backend runs, tmux renames the window to the foreground command
+       (`node`/`claude`) and `mc-<sess>:<tab>` no longer resolves. ⇒ IMMEDIATELY after creating the
+       window, disable it: `tmux set-option -t mc-<sess>:<tab> -w automatic-rename off \; set-option
+       -t mc-<sess>:<tab> -w allow-rename off` (and set `set-option -g automatic-rename off` once at
+       session create). Then re-assert the name: `tmux rename-window -t mc-<sess>:<tab> <tab>` won't
+       be clobbered.
+  - **SELF-CHECK the generating agent MUST run after spawning the Boss** (so it can't skip this like
+    a soft note): `tmux list-windows -t mc-main -F '#{window_name}' | grep -qx Boss && echo
+    WINDOW_OK` MUST print `WINDOW_OK`, AND `tmux attach -t mc-main:Boss` (run headless via
+    `tmux -C` or a 1-line `tmux display-message -pt mc-main:Boss '#{window_name}'`) MUST return
+    `Boss`, NOT `can't find window`. If either fails, the spawn is defective — fix the window
+    naming, do not ship.
+  - 🔴 **NESTED SPAWN MUST NOT DISCONNECT ANYTHING — `mp spawn` is called FROM INSIDE an agent's
+    own tmux pane** (an engineer born from a TODO comment runs `mp spawn` to create another
+    engineer). The session `mc-<sess>` and every existing window (and any attached ttyd client)
+    MUST survive untouched. Root causes that drop the session/ttyd, all FORBIDDEN:
+    1. **Clobbering the session.** NEVER `tmux kill-session`/`kill-server` in spawn, and NEVER
+       `tmux new-session -s mc-<sess>` unconditionally — a second `new-session` on an existing name
+       either errors or (if paired with a "kill-session first" for idempotency) **destroys the
+       running session, killing every agent + dropping ttyd**. ⇒ create the session ONCE,
+       idempotently: `tmux has-session -t mc-<sess> 2>/dev/null || tmux new-session -d -s mc-<sess>
+       -n <tab> …`; every additional agent uses `tmux new-window -t mc-<sess> -n <tab> …` ONLY.
+    2. **Nesting from inside a pane.** Because the caller already runs inside tmux (`$TMUX` set),
+       a bare `tmux new-session` warns/nests and `tmux switch-client`/`attach`/`select-window`
+       would **yank the attached ttyd client to another window = the human's disconnect**. ⇒ spawn
+       MUST use only **detached, explicitly-targeted** commands (`new-window -d -t mc-<sess>`,
+       `send-keys -t mc-<sess>:<tab>`), NEVER `switch-client`/`select-window`/`attach`, and should
+       run them with `TMUX= ` cleared (or via the absolute socket) so the caller's pane is never
+       the implicit target.
+    3. **ttyd churn.** A new window appearing in a session does NOT disconnect a tmux client by
+       itself — so do NOT restart ttyd or kill the session on spawn; ttyd's attached client keeps
+       its window. Adding a window is invisible to an attached `-t mc-<sess>:<other>` client.
+    - **SELF-CHECK (the generating agent MUST run it):** from inside the Boss/an engineer pane,
+      capture the attached client, `mp spawn` a child engineer, then assert the parent session +
+      client are intact: `tmux has-session -t mc-main` still true, the pre-existing windows still
+      listed, and `tmux list-clients -t mc-main` shows the same attachment (no drop). If the spawn
+      killed/switched the session, it is defective — do not ship.
 - `mp send <agent_id> <msg>` — delivers `msg` into the agent's tmux composer and submits it
   (bracketed-paste + Enter, with retry). `mp peek <agent_id>` — returns the agent's live pane +
   a classified state (IDLE/BUSY/BLOCKED). `mp kill <agent_id> [--reason …]` — retires it.
@@ -138,8 +196,11 @@ no-ops and add-task never reaches the Boss** (the worst kind of bug — board up
 told). Generated launchers must guarantee this; Verify asserts the ping lands (§15 J3).
 
 **5.2 `attach_base` must advertise the node's TAILNET IP, never a docker-internal/LAN IP.** The
-HUD builds each agent's attach link from the owning client's `attach_base`. If the client
-advertises `http://172.17.0.x:7681` (docker bridge) the link is dead from the human's machine.
+queue-server joins the owning client's `attach_base` onto each agent row and emits a ready-built
+`attach_url` (§4); the HUD renders every live agent's ATTACH button **directly from that
+`attach_url`** (an `<a href>`/clickable that opens the §5.7 ttyd pane in a new tab). A live agent
+row whose host is heartbeating MUST show a working ATTACH button — never an empty cell. If the
+client advertises `http://172.17.0.x:7681` (docker bridge) the link is dead from the human's machine.
 The client must publish `http://<tailscale-100.x-ip>:7681`. Get the tailnet IP from
 `tailscale ip -4`; **for that to work on a userland/no-systemd tailscaled, symlink the default
 socket → the custom socket** (see 5.6) so the bare `tailscale` CLI resolves it.
@@ -173,19 +234,81 @@ a second Enter:** a multi-line prompt renders collapsed as `[Pasted text #1]` an
 does NOT reliably submit; `mp send`/`spawn` must send Enter, wait ~0.4s, then send a **second
 Enter** (a redundant Enter on an empty composer is a harmless no-op). Verify proves a Boss actually
 spawns AND survives (§15 J2/J4).
+**5.5c — folder-trust must be pre-accepted for ANY working dir (folded 2026-06-18, CEO).** Claude
+Code shows a **"Accessing workspace … — trust this folder?"** dialog the first time an agent opens a
+directory not yet trusted — keyed PER exact path in `~/.claude.json` under `projects`. Pre-trusting
+only the MAIN cwd is not enough: a spawn in a NEW/different cwd (e.g. `~/mypeople/run/eng`)
+re-triggers the dialog and BLOCKS the agent.
+> **🔴 THIS IS THE PRODUCT'S OWN JOB — a real user installs mypeople on a VANILLA machine with NO
+> pre-seeded trust, so the SEED'S INSTALL + the generated `mp` MUST handle folder-trust themselves
+> (re-folded 2026-06-18, CEO). Do NOT assume any substrate/golden-image bake — that only helps OUR
+> harness; the product must stand alone.** Two MANDATORY product-level mechanisms:
+1. **The install (§12 Steps) MUST, on a fresh `~/.claude.json`, write the trust pre-accept itself** —
+   MERGE (preserve existing keys): `projects["$HOME"].hasTrustDialogAccepted=true` (parent → descendant
+   cwds inherit) AND `$INSTALL_DIR`, `$INSTALL_DIR/run`, `$INSTALL_DIR/run/eng`, `…/run/boss`, `…/bin`.
+   This is part of the generated install on the USER's machine, not provisioned from outside.
+2. **The generated `mp spawn` MUST, for the exact `--cwd` it launches in, set
+   `projects[<that cwd>].hasTrustDialogAccepted=true` (merge) in `~/.claude.json` BEFORE exec'ing
+   `claude`** — so ANY spawn cwd (even one not pre-listed) is trusted by construction. (Same
+   robustness as the §5.5 bypass-dialog auto-dismiss.)
+   **SELF-CHECK the generating agent runs before declaring done (on a CLEAN trust state):**
+   `python3 -c 'import json,os;d=json.load(open(os.path.expanduser("~/.claude.json")));print(d["projects"].get(os.path.expanduser("~/mypeople/run/boss"),{}).get("hasTrustDialogAccepted"))'`
+   → MUST print `True` after the install (i.e. the install pre-trusted the Boss cwd). And `mp spawn`
+   in a brand-new `mkdir`'d dir MUST reach the bypass banner with no trust prompt.
+3. (Harness-only, NOT the product's mechanism) OUR golden image may also bake trust for fast OUR-side
+   spins — but **this MUST NOT be what makes the product pass**; J35 tests on a vanilla trust state.
 
 **5.6 Tailnet on a no-systemd container = userland `tailscaled` on a custom socket + a default-
 socket symlink.** Start `tailscaled --state=<dir>/tailscaled.state --socket=<dir>/tailscaled.sock`
 under `$INSTALL_DIR/run/tailscale-state/`, `tailscale --socket=<sock> up …`, then
 `ln -sf <sock> /var/run/tailscale/tailscaled.sock` so the **bare** `tailscale` CLI (and 5.2's
 `tailscale ip -4`) work. Needs `/dev/net/tun` + `NET_ADMIN`.
+> **`tailscale up --accept-dns=false` — MagicDNS MUST NOT hijack `/etc/resolv.conf` (folded
+> 2026-06-18, fresh-run substrate fix).** By default `tailscale up` lets MagicDNS rewrite
+> `/etc/resolv.conf` to the tailnet resolver (100.100.100.100), which **breaks public DNS inside the
+> container — github.com / npm / apt resolution fails mid-hydration**. ALWAYS pass
+> **`--accept-dns=false`** so the container keeps its working resolver. If anything already clobbered
+> `/etc/resolv.conf`, restore a public resolver (e.g. `nameserver 8.8.8.8`/`1.1.1.1`) as a fallback.
+> (Tailnet IP reachability — §5.2/J10 — does NOT need MagicDNS; we use the `100.x` IP directly.)
+> **ALWAYS join NON-INTERACTIVELY via `TS_AUTHKEY` — an interactive `tailscale up` is THE BUG to
+> prevent (folded 2026-06-18, CEO; supersedes the earlier skip-tailnet idea).** `tailscale up` MUST
+> be passed a pre-provisioned non-interactive **`TS_AUTHKEY`** (`tailscale up --authkey="$TS_AUTHKEY"
+> …`) so it joins the tailnet WITHOUT ever opening a `login.tailscale.com` browser device-login.
+> **Every node that hydrates this seed — including an inner/nested product container — is provisioned
+> the authkey by its substrate** (the substrate mints/passes `TS_AUTHKEY` into the inner before
+> hydration; reuse the same non-interactive key the outer already used, or mint a fresh ephemeral
+> one). **NEVER skip tailnet, and NEVER fall into interactive `tailscale up`.** If `TS_AUTHKEY` is
+> absent, that is a **PROVISIONING ERROR to surface and fix** (`echo BLOCKED_REASON=no_ts_authkey;
+> exit 1`), **not** a reason to skip the join. With the key, the join is clean + headless and J10
+> runs normally.
 
-**5.7 ttyd: one writable instance, `tmux attach`, per-tab attach via URL args.** Run
-`ttyd -W -a -p 7681 … tmux attach`. `-a` (allow URL args) is mandatory so
-`?arg=-t&arg=mc-<sess>:<tab>` attaches to a specific window. **Verify ttyd FUNCTIONALLY (HTTP
+**5.7 ttyd: one writable instance, per-tab attach via URL args — each attach lands on ITS OWN
+window, isolated per viewer.** Run `ttyd -W -a -p 7681 <attach-helper>`. `-a` (allow URL args) is
+mandatory so `?arg=-t&arg=mc-<sess>:<tab>` reaches the helper. **Verify ttyd FUNCTIONALLY (HTTP
 200 on the attach URL) and by bare option name — ttyd 1.7.x rewrites argv for `ps`
 (`-t key=value` shows as `key value`), so never grep for `disableLeaveAlert=true`.** A stray
 `pkill` must not blank the human's window: run ttyd under a supervisor (respawn within ~2s).
+🔴 **Do NOT run a bare `tmux attach -t mc-<sess>:<tab>` per connection.** All clients attached to
+the SAME tmux session share ONE current-window (tmux forces every client of a session to the same
+active window), so attaching to the Boss while an engineer window is active **lands on the engineer
+pane** (the CEO's "attach opened the wrong window" bug) — and selecting the target would yank every
+other viewer too. ⇒ The attach-helper MUST give each connection its **own window selection via a
+grouped session** — created **ATTACHED in ttyd's pty in ONE command**, NEVER detached-then-attached:
+```
+exec tmux new-session -t mc-<sess> -s _v_<tab>_<uniq> \; select-window -t <tab> \; \
+     set-option destroy-unattached on
+```
+`new-session -t mc-<sess>` (a grouped session: shares the windows, **INDEPENDENT current-window**)
+runs **WITHOUT `-d`**, so tmux attaches it directly in ttyd's pty — the session has a client the
+instant it exists. `select-window -t <tab>` lands on exactly this row's window; `set-option
+destroy-unattached on` runs LAST, on the now-ATTACHED session, so it only reaps on a later
+disconnect. `<uniq>` = `$$`+`$RANDOM` (or `$(date +%s%N)`) to avoid name collisions.
+🔴 **The fatal regression to avoid (CEO 2026-06-18):** do **NOT** `tmux new-session -d …` then `set
+destroy-unattached on` then a separate `attach` — the `-d` session starts with NO client, so
+`destroy-unattached on` **reaps it instantly** and the follow-up `attach` fails with `can't find
+session: _v_<tab>_…` + ttyd's "Press Enter to Reconnect" (which never recovers). Create-attached in
+one command; set destroy-unattached only after it's attached. The clickable row's `attach_url`
+(§4/§5.2) still carries `-t mc-<sess>:<tab>`; the helper does the grouping.
 
 **5.8 Daemons are detached + pid-tracked + idempotently restartable.** Start with `setsid …
 </dev/null &`, write a pidfile, and a reinstall stops the prior by pidfile then restarts — never
@@ -243,6 +366,43 @@ self-hosts. (Root cause of the defect: the install-flow reused ONE `queue.env`/q
 ports for both, so installing the inner clobbered the outer JOIN → the node vanished from the
 CEO's HUD.) "I asked for X substrates, I see X" (§7.1) depends on this isolation holding.
 
+**5.12 The QUEUE_SECRET MUST NEVER reach the browser (security — folded 2026-06-18, browser-QA).**
+A served page is public; **anything in its HTML/JS is readable by anyone who loads it.** So the
+secret stays **server-side only** and the browser authenticates by a **server-set httpOnly session
+cookie** (a random token minted when the page is served — NOT the secret; httpOnly so JS can't read
+it), auto-sent on same-origin fetches. Gated endpoints accept **either** that cookie (browser) **or**
+the `X-Queue-Secret` header (machine clients: queue-client, `mp`, cross-node). **Forbidden:**
+injecting the secret into the page (no `__INJECT_SECRET__`, no `const SECRET="…"`, no secret in any
+`<script>`/attribute/data-blob), and embedding it in attach/recording URLs. Verify greps the served
+`:9933/` + `:9900/dashboard` bytes and FAILS if the live `QUEUE_SECRET` value — or any secret-bearing
+token — appears (§15 J30).
+> **🔴 HARD, SELF-CHECKABLE CONTRACT — SESSION COOKIE IS MINTED ON THE PAGE GET (re-folded twice; a
+> blind generate keeps missing this — make it impossible to miss):**
+> 1. **`GET /`, `GET /todos`, `GET /dashboard` MUST each respond with EXACTLY ONE `Set-Cookie:`
+>    header** minting the session, e.g. `Set-Cookie: mp_session=<random>; HttpOnly; Path=/;
+>    SameSite=Lax`. (The value is a random session token — NOT the QUEUE_SECRET.)
+> 2. The server treats a valid `mp_session` cookie as authorized on gated endpoints (same as
+>    `X-Queue-Secret`). So the page's **VERY FIRST** `/todo/*` (or `/agents`,`/clients`,`/roster`)
+>    fetch already carries it — no 401. Do NOT mint it lazily via a separate `/session` call (that
+>    races → first fetch is cookieless → 401 → console error → browser-QA J31/J33/J34 break). Do NOT
+>    fire any gated `fetch()` before `DOMContentLoaded`.
+> 3. **SELF-CHECK before you declare done (run this exact command):**
+>    `curl -sI http://127.0.0.1:9933/ | grep -ic '^set-cookie:'` → MUST print **`1`**; same for
+>    `http://127.0.0.1:9900/dashboard`. If it prints `0`, your page GET is not minting the cookie —
+>    FIX IT before finishing. (This is J30's header-level gate; the browser-QA gates J31/J33/J34
+>    cannot pass until this prints 1.)
+> The cookie MUST be set by the page response so the page's
+> VERY FIRST gated fetch already carries it — NOT lazily via a later `/session` call (that races and
+> the first `/todo/board` fetch comes back **401 → console error → browser-QA J31/J33/J34 fail**). Do
+> NOT fire any gated `fetch()` before the document (with the cookie) has loaded. **This is now a
+> HEADER-LEVEL gate in J30 (`curl -I` must show Set-Cookie) — caught without a browser, so a blind
+> generate cannot pass while missing it.**
+
+**5.13 Serve `/favicon.ico` (folded 2026-06-18 — fresh-run J31 fail).** Browsers auto-request
+`/favicon.ico`; if the server 404s it, the browser-QA "zero console errors" gate (J31) FAILS on that
+benign 404. Both servers (`:9933` + `:9900`) MUST serve `/favicon.ico` with a **204 (or a tiny
+200 icon)** — never a 404. (A blind generate that omits this trips J31 first-try.)
+
 ---
 
 ## 6. The TODO board (state + API + the board→Boss ping)
@@ -250,7 +410,9 @@ CEO's HUD.) "I asked for X substrates, I see X" (§7.1) depends on this isolatio
 The TODO app (`todo-server.py`, `:9933`) serves `todos.html` at `/` and `/todos`, and a JSON API
 (all gated by `X-Queue-Secret` except the page + `/health`):
 - `GET /todo/board` → the board JSON. `POST /todo/update` ops: **`add` `{text}`** (creates a task
-  in `needs_brainstorm`, prepends to `order`, returns `{ok,id}`), **`del {id}`**, **`set {id,…}`**.
+  in **`idle`** — folded 2026-06-18, was `needs_brainstorm`; a new task is born **idle** and sits
+  there, directly pickup-able, until an engineer moves it to `working` — NO brainstorm gate),
+  prepends to `order`, returns `{ok,id}`), **`del {id}`**, **`set {id,…}`**.
   **FIELD NAMES (the contract — your generated page and server MUST agree on these exact names):**
   the `set` fields are **`text`, `doneCondition`, `workToDone`, `state`, `done`, `assignee`** — note
   **`state`** (the status field, NOT `status`) and **`doneCondition`** (NOT `cond`). `GET /todo/board`
@@ -258,32 +420,76 @@ The TODO app (`todo-server.py`, `:9933`) serves `todos.html` at `/` and `/todos`
   subtasks (no `add{parent}`, no `parent` field), dependencies (no `dependsOn`), the hard-gate (no
   `hardGate`), and **manual reorder** (no
   `reorder` op, no up/down). The board renders in `order` (newest-first), sorted-visible-then-hidden
-  client-side only.
+  client-side only — **EXCEPT pinned tasks float to the top (§7.3 below).**
+- 🔴 **§7.3 PINNING (WhatsApp-starred style — CEO 2026-06-20).** A task can be **pinned** (starred)
+  to float above all normal tasks. Two `POST /todo/update` ops: **`pin {id}`** and **`unpin {id}`**.
+  - **`pin {id}`:** if the task is already pinned → no-op `{ok:true}`. Else, **enforce MAX 5 pinned**
+    — if 5 tasks are already pinned, REJECT with `{ok:false, error:"pin_limit"}` (do NOT pin a 6th;
+    the UI surfaces "unpin one first"). Otherwise set `pinned=true` and assign `pinRank = ++pinSeq`
+    (the board-level monotonic counter), so **the 1st-ever pin gets the lowest rank, the next higher,
+    etc. = pin order is insertion order.** `pinSeq` only ever increases (a later re-pin lands at the
+    end), and it persists in the store.
+  - **`unpin {id}`:** set `pinned=false`, `pinRank=null`. The task returns to its NORMAL position
+    (its place in `order`, newest-first) — unpinning never reshuffles the other pins.
+  - **Board ordering (server + the page agree):** render **pinned tasks FIRST, sorted by `pinRank`
+    ascending** (pin order), THEN the normal tasks in `order` (newest-first). `pinned`+`pinRank` are
+    returned per task on `/todo/board` and **persist** across page reload AND server restart (they
+    live in `board.v2.json`, §4).
+  - This is NOT the cut "manual reorder" (no `reorder` op, no up/down arrows) — it is a binary
+    pin/unpin star with a capped, insertion-ordered pinned group.
 - `POST /todo/comment {task_id, by, body}` — append a thread comment; **`by` is the author's
   agent_id** for agent comments (`host/sess:tab`), or `"CEO"` for the human.
 - `GET /todo/attach?agent=<agent_id>` → `{ok, target:"mc-<sess>:<tab>", base:"<attach_base>"}` —
   resolves an agent to its ttyd attach target (looks up the host's `attach_base` from
   `/clients`). This is the resolver behind click-to-terminal (§7).
-- `POST /todo/brainstorm {task_id, body}`, `POST /todo/answer {task_id, body}` (answers the open
-  question → promotes out of `needs_brainstorm`), `POST /todo/status {task_id, state}`,
-  `POST /todo/proof {task_id, kind, url|body}` (kind ∈ image|video|link|text) — thread/state events.
+- `POST /todo/status {task_id, state}`, `POST /todo/proof {task_id, kind, url|body}`
+  (kind ∈ image|video|link|text) — state/thread events.
+  🔴 **PROOF OBJECT SHAPE is a HARD contract — server-stored, board-returned, and client-rendered
+  MUST use the SAME field names (CEO 2026-06-18: a `{type,ref}` server vs `{kind,url,body}` client
+  mismatch made video chips not render).** Each element of `proofs[]` is **`{kind, url, body, ts}`**
+  — `kind` (NOT `type`), `url` (NOT `ref`; set for image/video/link), `body` (text proofs). Store
+  the POST params VERBATIM under these names, return them unchanged on `/todo/board`, and the card
+  renderer reads `p.kind` + `p.url`/`p.body` (image→`<img src=url>`, video→`<video src=url>`,
+  link→`<a href=url>`, text→`body`). Do NOT rename to `{type,ref}` anywhere. A posted video proof
+  MUST render its chip on the card (J22).
+  🔴 **The server MUST CLASSIFY `kind` FROM THE ACTUAL MEDIA — never blind-default to `text` (CEO
+  2026-06-18: an uploaded PNG/MP4 was accepted but stored `kind:'text'`, so it rendered a text chip
+  instead of an image/video).** Root cause to avoid: `kind = body.get('kind','text')` trusting the
+  client + a `text` fallback. Instead: (1) if the proof carries an uploaded **file** (multipart) OR
+  a data: blob, derive kind from its **content-type/extension** server-side; (2) if it carries a
+  **url**, infer kind from the url extension when `kind` is missing/`text` —
+  `.png/.jpg/.jpeg/.gif/.webp/.svg → image`, `.mp4/.webm/.mov/.m4v → video`, other `http(s)` →
+  `link`; (3) only `text` when there is genuinely no media (a typed note in `body`). The card modal
+  MUST expose a working proof control (file picker and/or media-URL field) that posts so the stored
+  kind is correct. A real image/video stored/rendered as `text` = FAIL (J22).
+  **REMOVED (CEO 2026-06-18 — the brainstorm
+  gate is cut entirely): NO `/todo/brainstorm`, NO `/todo/answer`, no `brainstorm` task field, no
+  "needs-brainstorm" banner/blocking.** A task goes `idle → working` with no gate.
 
 **You GENERATE both the page and the server** (truly generative — no pinned/pasted UI). They must
 agree on: the routes above, the `set` field names (`doneCondition`/`state` — see above), the `state`
-enum `needs_brainstorm|working|review|blocked|done|cancelled`, the board shape (per-task `text`,
-`state`, `assignee`, `doneCondition`, `workToDone`, `brainstorm`, `comments[]`, `proofs[]`, `unread`,
-`verified`, `pingsToBoss`), and the board→Boss ping. The page authenticates its gated calls with the
-live `QUEUE_SECRET` (serve it injected — e.g. the server replaces an `__INJECT_SECRET__` token in the
-page at serve-time). **§7 specifies the look/feel (PLOW tokens + layout) and §A.2 lists every feature
+enum **`idle|working|review|done`** (main flow) **+ `blocked|cancelled`** (side-exits) — **no
+`needs_brainstorm`**, the board shape (per-task `text`,
+`state`, `assignee`, `doneCondition`, `workToDone`, `comments[]`, `proofs[]`, `unread`,
+`verified`, `pingsToBoss`) — **no `brainstorm` field**, and the board→Boss ping. **The page makes same-origin calls and carries
+NO secret — auth is server-side (§5.12): serving the page mints an httpOnly session cookie the
+browser auto-sends; the QUEUE_SECRET stays on the server and never reaches client JS/HTML.**
+**§7 specifies the look/feel (PLOW tokens + layout) and §A.2 lists every feature
 as a MANDATORY behavioral contract with its Verify gate — none is optional; the blind agent generates
 all of it and may skip nothing.**
 
-**board→Boss ping (the core value):** on a **non-test** `add` (and on work-state transitions),
-the server **pings the Boss**: `mp send <BOSS_AGENT> "[todo] task <id> \"<title>\": <reason>…"`.
-`BOSS_AGENT` defaults to `main:Boss`. Test tasks (`{test:true}`) are EXEMPT from the ping — so a
-real board→Boss Verify gate MUST add a non-test task (§15 J3). The server logs each ping +
-its `mp send` result to `todos/boss-inbox.log` (write `MP_SEND -> main:Boss rc=<n> :: …`). Per
-5.1, the ping only works if `mp` is on the server's PATH.
+**board→Boss ping (the core value — EVERY message pings, not just create):** the server **pings the
+Boss** on **both** events (folded 2026-06-18, CEO):
+- a **non-test `add`** (and work-state transitions): `mp send <BOSS_AGENT> "[todo] task <id>
+  \"<title>\": <reason>…"`;
+- **every `/todo/comment`** (a human/agent comment on a task): `mp send <BOSS_AGENT> "[todo]
+  comment on <id> \"<title>\" by <by>: <body>…"` — so a CEO follow-up comment reaches the Boss and
+  drives the next round (this is what the §15 J32 joke-loop depends on). The comment-ping is
+  **exempt only when `by` is the Boss itself** (don't ping the Boss for its own comment) and for
+  `{test:true}` tasks.
+`BOSS_AGENT` defaults to `main:Boss`. The server logs each ping + its `mp send` result to
+`todos/boss-inbox.log` (`MP_SEND -> main:Boss rc=<n> :: …`). Per §5.1 the ping only works if `mp` is
+on the server's PATH. **Verify gates BOTH: add→ping AND comment→ping (§15 J3 + J32).**
 
 ---
 
@@ -308,26 +514,61 @@ backgrounds ONLY), Grove `#5E7A5E`, Iris `#C4BFFF`; surfaces `--dark-bg #111110`
 +0.06em). Volt buttons: Volt bg + Midnight text; hover adds a volt glow box-shadow.
 
 **HUD (`/dashboard`):** Instrument-Serif title "mypeople — HUD"; a DM-Mono meta line
-(refreshed + client count); the **agents table** (AGENT_ID, STATE, BACKEND, BOSS, SUMMARY,
+(refreshed + agent count); the **agents table** (AGENT_ID, STATE, BACKEND, BOSS, SUMMARY,
 ATTACH) where `alive` renders in Volt; an **ATTACH** link per agent =
 `<attach_base>/?arg=-t&arg=<tmux_target>` (opens the live pane); a **"Retired engineers"** table
-with a per-engineer **Revive** (Volt) button. Polls `/agents`+`/clients`+`/roster` every ~3s.
+with a per-engineer **Revive** (Volt) button. Polls `/agents`+`/roster` every ~3s.
 
-**§7.1 Machines grid (CEO requirement — confirm "I asked for X, I see X").** The HUD must render
-a **grid of every machine/container connected to the grid** (one card per `/clients` entry),
-**GROUPED BY `purpose`/hydration, with a per-group COUNT in the group header** — e.g. a
-`mypeople hydration · 5` group and an `airbnb hydration · 3` group, **never a single flat
-total**. The grouping + counts are the whole point: the CEO asks for X substrates of a hydration
-and visually confirms exactly X cards under that group. Each node card shows: **type**
-(`node_type`: one-shot eng / long-lived eng / always-running system agent / in-substrate install
-eng), **machine** (`hostname`), **state** — the hydration lifecycle **`hydrating`** (Volt/pulsing,
-inner not up yet) / **`ready`** (inner Verify passed) / **`failed`**, plus alive/dead liveness —
-so the CEO sees nodes appear as **hydrating the moment they start**, an **attach link** (`<attach_base>/?arg=-t&arg=mc-main:Boss`, or the node's primary agent), and the
-**seedrec recording link** (`recording_url`, shown only when present). Counts are derived live
-from `/clients` (group by `purpose`, count members) — they update as nodes join/leave.
+**§7.1 — REMOVED (CEO 2026-06-18): the generated HUD has NO "MyPeople Hydration" / machines-grid
+section.** The product HUD must NOT render a per-`purpose`/hydration grid of machines (the CEO isn't
+using it). **Keep ONLY the agents table + the Retired-engineers table.** Do NOT generate a machines
+grid, purpose-groups, hydration-counts, or per-node cards in `dashboard.html`. (The `/clients`
+endpoint + its `purpose`/`state`/`node_type` heartbeat fields still EXIST for the OUTER fleet uplink
+/ §5.11 central visibility — that is OUR central HUD, a separate concern — but the GENERATED product
+HUD does not display them.)
 
-**TODO (`/`):** Instrument-Serif "Priorities"; add-a-task input (Enter to add); the board
-columns/cards; a **card modal** with the comment **thread**.
+**TODO (`/`) — production-quality (CEO 2026-06-18: match the production app's UX, not a thin
+sketch).** Instrument-Serif "Priorities"; an add-a-task input (Enter to add); the board as a list of
+task **cards**, each showing the title (inline-editable), a **state badge** (`idle|working|review|
+done|blocked|cancelled`, color-coded), the **assignee** chip, an **unread** badge, a `↑boss`
+ping count, and a **★ pin star** (§7.3). Clicking the star pins/unpins via `update{op:'pin'|'unpin',
+id}`; **pinned cards render in a visually-distinct group ("Pinned"/★) at the TOP of the board, in
+pin-rank order**, above all normal cards. The star is filled/Volt when pinned, outline when not.
+When 5 are already pinned, attempting a 6th pin is **blocked** with a clear hint (e.g. toast/disabled
+state "Unpin one first — max 5"), matching the server's `pin_limit` rejection. Pin state survives
+reload (re-fetch `/todo/board`). Clicking a card opens a **card modal** with: the done-condition and the **comment
+thread** (author + body + timestamp, newest last) with a **composer** to post a comment (NO
+brainstorm block — removed). Filter/sort controls and live counts
+are welcome. **Quality bar:** no broken layout, **zero console errors**, every control wired to a
+real endpoint (no dead buttons) — browser-QA (J31) fails on console errors or a non-functional
+control. Reference for *quality/feature-completeness* (NOT for pixel-copy): the production board at
+`127.0.0.1:9933`.
+🔴 **The card modal open/close MUST be ATOMIC — one source of truth (CEO 2026-06-18: the modal got
+stuck with `#modal{display:block}` while `#modalbg{display:none}`, so the normal close click failed
+and needed a force-click).** Do NOT toggle the modal panel and its backdrop with two independent
+`style.display` writes that can desync. Drive BOTH from a **single state** — e.g. toggle one class
+on a container (`document.body.classList.toggle('modal-open')` or `#modal.classList.toggle('open')`)
+and let CSS show/hide panel+backdrop together — OR a single `openModal()`/`closeModal()` pair that
+sets panel AND backdrop in the same call. **Close MUST always work** and be bound to all of: the
+**✕ button**, **Escape key**, and a **backdrop click**, every one calling the SAME `closeModal()`.
+After close, BOTH the panel and the backdrop are hidden (no leftover `display:block`/`none`
+mismatch), and re-opening works. A modal that needs a force-click to close = FAIL (J31).
+
+**§7.2 LIVE updates / HOT RELOAD (CEO 2026-06-18 — no manual refresh, REQUIRED + gated J33).** Both
+pages reflect server-side changes **in real time without a page reload**: new tasks, **new comments/
+replies in an open card thread**, state changes, and the HUD grid/agents/counts all appear within a
+few seconds automatically. Implement by **polling** the relevant endpoint on a short interval
+(≤~3s — `/todo/board` for the TODO incl. the open card's thread; `/clients`+`/agents`+`/roster` for
+the HUD) or via SSE; **merge into the DOM without losing the user's in-progress input** (don't clobber
+a half-typed comment). A page that needs a manual refresh to show a new comment = FAIL (J33).
+> **FOCUS + CARET MUST SURVIVE THE POLL (folded 2026-06-18 — CEO: the 1s reload kept stealing focus
+> from the add-task box, impossible to type).** The incremental update must **NEVER re-render or
+> replace the input element the user is currently focused in** (the add-task box, an inline-edit
+> field, or the comment composer), and must **NOT move/reset the caret or text selection**. Extend
+> the existing "dirty fields preserved" diff so the **focused element + its `selectionStart/End`
+> survive every poll** — either skip re-rendering the focused node entirely, or restore
+> `document.activeElement` focus + caret position immediately after the DOM merge. Typing must be
+> uninterrupted by the poll. Gated by J34.
 
 **ITEM 2 — cross-navigation (one connected system):** the TODO page has a visible **HUD ↗** link
 to `http://<same-host>:9900/dashboard`, and the HUD has a **TODO ↗** link to
@@ -347,11 +588,32 @@ opens `<base>/?arg=-t&arg=<target>` in a new tab (the §5.7 ttyd attach). Non-ag
 
 - **`boss-CLAUDE.md` (generated doctrine):** the Boss's job description, internalized on
   `--master` spawn. Capture the doctrine **intent** (do not paste a fixed essay): (1) plan-gate —
-  no engineering without a brainstorm + plan + verify; (2) autonomous loop — keep the team
-  working off the TODO board; (3) fire-and-forget through the queue (`mp`), never raw tmux;
-  (4) the board (`:9900/dashboard` + the TODO) is the source of truth. The onboarding turn must
-  end with the Boss summarizing its role (Verify can assert the summary carries ≥2 doctrine
-  keywords — proves it actually read the doctrine).
+  no engineering without a plan + verify (NO brainstorm gate — removed 2026-06-18); (2) autonomous
+  loop — keep the team working off the TODO board; (3) fire-and-forget through the queue (`mp`),
+  never raw tmux; (4) the board (`:9900/dashboard` + the TODO) is the source of truth. **The
+  onboarding turn MUST end with the Boss writing a DURABLE roster summary that explicitly contains
+  ≥2 doctrine keywords** from {`plan`,`approve`,`queue`,`mp`,`autonomous`,`verify`,`fire-and-forget`}
+  (J2c asserts this — a generic summary with 0 keywords = FAIL). **Root-cause of the first-try fail
+  (folded 2026-06-18): this was "Verify CAN assert" (soft) + the Stop hook overwrote the doctrine
+  summary with a generic line.** So: the onboarding summary string must be keyword-bearing BY
+  CONSTRUCTION, and **persisted so the Stop hook never clobbers it to generic** (§5.9-adjacent: the
+  hook preserves the onboarding summary unless the Boss writes a new keyword-bearing one).
+- **The end-to-end comms loop MUST close first-time (CEO 2026-06-18 — gated J32).** On a `[todo]`
+  ping (create OR comment, §6), the Boss **MUST act AUTONOMOUSLY, without further human prompting**:
+  (a) reads the task/comment, (b) **immediately `mp spawn`s an engineer** and assigns the task to it
+  (do NOT leave the task sitting in `idle` waiting to be told — the ping IS the trigger; the engineer
+  picks it up, moving `idle → working`),
+  (c) the engineer does the work and **posts results back into the TODO** (`POST /todo/comment` as
+  its agent_id) — NOT into raw tmux; (d) when the CEO **comments** a follow-up, the comment-ping
+  reaches the Boss and it **runs the next round**. **Root-cause of the first-try fail (folded
+  2026-06-18): the doctrine described the loop but didn't MANDATE the Boss spawn-on-ping autonomy, so
+  the first Boss sat idle on the joke task (0 jokes).** The autonomous spawn-on-task is the contract,
+  not optional. (Linked to J2c: a Boss with a real keyword-bearing doctrine summary actually drives.)
+- **One question per turn — never batch (CEO 2026-06-18).** When an engineer must ask/produce a
+  series (the CEO's acceptance test is a **joke protocol**: "give me jokes one at a time"), it asks/
+  posts **ONE, waits for the reply, then the next** — ask 1 → wait → ask 2 → wait → ask 3 — never
+  three at once. Drive multi-step exchanges via `AskUserQuestion`/sequential comments, one round per
+  turn. (J32 runs exactly this: create → Boss → engineer posts joke 1 → CEO comment → joke 2 …)
 - **Supervisor:** §5.3.
 
 ---
@@ -409,7 +671,8 @@ Author each from §3–§8. They interoperate because you write them together to
 - `bin/todo-server.py` + `bin/todos.html` — GENERATED: the TODO board API + board→Boss ping (§6)
   and the page, built from the PLOW tokens (§7) + the §A.2 feature contracts. The page + server you
   write must agree on the §6 API.
-- `bin/dashboard.html` — GENERATED: the HUD (§7/§7.1), built from the PLOW tokens + §A.2 F17–F22,
+- `bin/dashboard.html` — GENERATED: the HUD (§7), built from the PLOW tokens + §A.2 **F20–F22 only**
+  (agents table + retired/revive + cross-nav; **NO machines/hydration grid — §7.1 removed**),
   served by queue-server at `/dashboard`; queue-server satisfies `/clients`+`/agents`+`/roster`+
   `/revive`.
 - `bin/boss-supervisor.sh` — always-one-Boss loop (§5.3).
@@ -439,7 +702,11 @@ Bare host (shell + authed `claude`). State intent; adapt commands to the host.
    `jq/procps/ttyd/tailscale` ARE missing — install them for real; do not assume.)
 3. **Layout + config.** Create `$INSTALL_DIR/{bin,run,status,todos,plugins}`; write
    `~/.config/mypeople/queue.env` (`QUEUE_SECRET` auto-gen if unset, ports, `HOST_ID`,
-   `LANG/LC_ALL=C.UTF-8`); set `hasCompletedOnboarding:true` in `~/.claude.json` (§5.5).
+   `LANG/LC_ALL=C.UTF-8`); set `hasCompletedOnboarding:true` in `~/.claude.json` (§5.5) **AND
+   pre-accept folder-trust for the Boss/agent dirs (§5.5c #1): merge
+   `projects[$HOME|$INSTALL_DIR|$INSTALL_DIR/run|/run/eng|/run/boss|/bin].hasTrustDialogAccepted=true`
+   on this (possibly fresh) `~/.claude.json`** — the install does this itself so a vanilla user's
+   Boss spawn never hits the trust dialog (do NOT rely on any external/golden-image seeding).
 4. **GENERATE every component** (§11 — servers, the TWO pages, `mp`, supervisor, hooks, doctrine,
    `~/.tmux.conf`) from the spec — write the code now, to the §4–§8 contracts. **The UI is generated
    from the PLOW tokens (§7) + the §A.2 feature contracts** (truly generative — no pasted components;
@@ -483,7 +750,7 @@ kill ephemeral test workers.
 
 > **CANONICAL ACCEPTANCE = a SINGLE STANDALONE node with NOTHING pre-existing.** The real test is
 > one fresh host, `UPSTREAM_QUEUE_URL` UNSET, no hub/fleet anywhere, reaching exit 0 on J1–J11 +
-> J14–J29 (its own inner `:9900` is the central + HUD). **Verify must NOT depend on any
+> J14–J33 (its own inner `:9900` is the central + HUD). **Verify must NOT depend on any
 > pre-existing hub** — if a gate only passes because a prior-generation central happens to exist,
 > the test is contaminated (CEO 2026-06-17). FLEET mode (J12/J13) is a SEPARATE, opt-in scenario:
 > to test it, generate a FRESH hub from THIS seed first (a standalone node = a central), then JOIN
@@ -518,22 +785,35 @@ kill ephemeral test workers.
 8. **Attach opens the LIVE pane.** ttyd is bound on the **advertised** port; the attach URL
    `<attach_base>/?arg=-t&arg=mc-main:Boss` returns 200 and the target is a **live (non-dead)**
    pane; a stray `pkill -x ttyd` is respawned (still 200 after ~5s) per §5.7.
+   🔴 **HTTP 200 is NOT sufficient** — ttyd serves 200 even when `tmux attach -t mc-main:Boss`
+   fails *inside* the terminal with `can't find window: Boss` (the failure is in the pane, not the
+   status code). This gate MUST ALSO prove the attach **target window resolves**:
+   `tmux list-windows -t mc-main -F '#{window_name}' | grep -qx Boss` (the spawned Boss window is
+   actually NAMED `Boss`, per the mp-spawn window-naming + `automatic-rename off` contract), AND the
+   attach pane does NOT contain the string `can't find window`. A gate that checks only the 200 is a
+   **false-green** and is rejected.
+   🔴 **AND the HUD must RENDER the clickable ATTACH button** (the URL resolving is necessary but
+   not sufficient — the human reaches it by clicking the row). Fetch the served `/dashboard` HTML
+   (with the §5.12 cookie) and assert the live Boss row carries a working attach control: the served
+   markup contains an `href`/`onclick` whose value equals `<attach_base>/?arg=-t&arg=mc-main:Boss`
+   (i.e. `/agents` joined `attach_base`+`attach_url` onto the Boss row per §4/§5.2, and the render
+   emitted the anchor). Concretely: `/agents` for the live Boss MUST return non-empty
+   `attach_base` and `attach_url`, AND the rendered HUD MUST contain that `attach_url` as a
+   clickable link in the Boss row. An empty ATTACH cell for a live, heartbeating agent is a
+   **false-green** and is rejected.
 9. **PLOW identity.** BOTH `:9933/` and `:9900/dashboard` carry **Volt `#D5EF8A`** + the Plow
    typefaces (`Instrument Serif`/`DM Sans`/`DM Mono`).
-10. **Reachable from the human's machine.** The HUD + TODO answer 200 on the node's **tailnet
-    IP** (not just localhost) — i.e. `attach_base`/pages use the `100.x` address (§5.2).
-11. **Machines grid grouped by purpose with counts (§7.1).** The HUD renders a grid of every
-    connected machine (one card per `/clients` entry) **grouped by `purpose` with a per-group
-    count header**, NOT a flat total. *Assert:* `GET /clients` carries `purpose`/`node_type`/
-    `recording_url`; the served HUD HTML implements per-`purpose` grouping + counts and per-card
-    `type/machine/state/attach/recording`. To exercise grouping, **test it in ISOLATION — NEVER
-    seed synthetic clients into the LIVE central.** Either group an in-memory/throwaway client list,
-    or hit a **throwaway queue-server on a scratch port** that you kill afterward. **If you must
-    POST probe heartbeats, you MUST unregister/delete every one before the gate returns AND assert
-    `/clients` is back to exactly the real node(s).** Probe hosts/IPs must be obviously-synthetic
-    and **removed** — they may NOT linger on the product grid (CEO 2026-06-17: a fresh HUD showed
-    phantom `alpha/beta/retiredtest` groups + dead `hydrating` nodes left by an un-cleaned grid
-    test). This is the "I asked for X, I see X" check — the CEO counts the cards under a group.
+10. **Reachable from the human's machine.** The HUD + TODO answer 200 on the node's **tailnet IP**
+    (not just localhost) — i.e. `attach_base`/pages use the `100.x` address (§5.2). The node ALWAYS
+    joins the tailnet non-interactively via `TS_AUTHKEY` (§5.6) — including an inner/nested product
+    container, which its substrate provisions with the key. (Folded 2026-06-18: this gate is NOT
+    skippable; the earlier "N/A when no tailnet" idea was wrong — the fix is to provision the authkey,
+    not to skip. An interactive `tailscale up` browser login is the bug, never the join itself.)
+11. **REMOVED (CEO 2026-06-18) — no machines/hydration grid in the generated HUD (§7.1 removed).**
+    The product HUD no longer renders a per-`purpose` grid; this gate is dropped. (The `/clients`
+    endpoint + `purpose`/`state` fields still exist for the OUTER fleet uplink, §5.11 — not gated
+    here.) Do NOT assert a grid; a generated HUD that ships a machines/hydration grid = FAIL of the
+    "no removed features" check.
 12. **Two-plane isolation — inner install never knocks the node off the central grid (§5.11).**
     **(FLEET-MODE ONLY — SKIP this gate entirely when `UPSTREAM_QUEUE_URL` is unset; a standalone
     install has no OUTER plane and is still fully Done.)** Prove the OUTER uplink and INNER product
@@ -566,19 +846,30 @@ kill ephemeral test workers.
 15. **Delete task.** `update{op:del,id}` removes the task from `/todo/board` (tasks + order). (F2)
 16. **Inline edit.** `update{op:set,id,text|doneCondition|assignee}` patches that field (note the
     REAL names per §6); read back on the board. (F3)
-17. **State enum.** Setting each of `working|review|blocked|done|cancelled|needs_brainstorm` via
-    `set{state}` (field is **`state`**, NOT `status`)/`/todo/status` persists + reads back; an
-    invalid value is rejected. (F4)
+17. **State enum (idle model — folded 2026-06-18).** A newly-added task is born **`idle`**. Setting
+    each of `idle|working|review|done|blocked|cancelled` via `set{state}` (field **`state`**, NOT
+    `status`)/`/todo/status` persists + reads back; **`needs_brainstorm` is NOT a valid state** (a
+    `set{state:"needs_brainstorm"}` is rejected); any invalid value is rejected (400). (F4)
 18. **Done toggle.** `set{done:true}`/`set{workToDone:true}` moves the task to `state=done`; the
     board reflects it. (F5)
-19. **Brainstorm + gating.** `/todo/brainstorm{task_id,body}` stores the body; a `needs_brainstorm`
-    task is flagged not-workable on the board. (F6)
-20. **Answer promotes.** `/todo/answer{task_id,body}` records the answer AND moves the task out of
-    `needs_brainstorm`. (F7)
+19. **idle → working with NO gate (folded 2026-06-18, replaces brainstorm gate).** A fresh task is
+    `idle`; `set{state:"working"}` (an engineer picking it up) succeeds with **no brainstorm/answer
+    gate** in the way. *Assert:* a just-added task has `state=idle`; it can go straight to `working`.
+    (F6)
+20. **Brainstorm gate is GONE (folded 2026-06-18).** Assert there is **no `/todo/brainstorm` and no
+    `/todo/answer` route** (404/unsupported), **no `brainstorm` field** on tasks, and **no
+    "needs-brainstorm" banner** in the UI. Any of these present = FAIL (the gate was cut). (F7)
 21. **Unread count.** `/todo/board` returns a per-task `unread` integer that rises when a new
     comment is added by someone other than the reader. (F9)
 22. **Proofs.** `/todo/proof{task_id,kind,url|body}` (kind ∈ image|video|link|text) appends to the
-    task's `proofs[]`, returned on the board. (F10)
+    task's `proofs[]`, returned on the board. (F10) 🔴 **Shape + classify + render gate (CEO
+    2026-06-18, two failures folded):** add a proof of an **image (a real `.png`)** AND a **video (a
+    real `.mp4`)** *through the UI's own proof control* (file upload or media-URL field — the same
+    path a human/agent uses), then assert: (1) `/todo/board` stores each as the EXACT contract shape
+    `{kind, url, body, ts}` — NOT `{type,ref}`; (2) the server **CLASSIFIED `kind` from the media** —
+    the `.png` is `kind:"image"` and the `.mp4` is `kind:"video"`, **NOT `kind:"text"`** (the
+    blind-default bug); (3) the rendered card shows a real `<img src=…>` / `<video src=…>` chip, not a
+    text chip or blank. An image/video accepted but stored/rendered as `text` = FAIL.
 23. **NO subtasks / dependencies / hard-gate (REMOVED — CEO 2026-06-17).** Assert these are ABSENT:
     the generated `todos.html` contains no "Add subtask", "add a dependency", "blocked by", or "hard
     gate" controls; and the backend does NOT implement `add{parent}` / `parent`, `dependsOn`, or
@@ -590,15 +881,11 @@ kill ephemeral test workers.
     retired flag (agent re-eligible), reflected on the next `/roster`. (F21) **Test it WITHOUT
     leaving a phantom:** any agent/host you register to exercise retire/revive MUST be removed before
     the gate returns — no `retiredtest`/`ghosthost`-style residue on the live `/roster` or grid.
-26. **FRESH-INSTALL GRID IS CLEAN — no test/demo fixtures (CEO 2026-06-17, gates MISSED this).**
-    After `## Steps`+`## Verify` finish, `GET /clients` on the node's OWN central returns **ONLY
-    the real node(s)** — for a standalone install, **exactly ONE entry (this node)**. **ZERO
-    synthetic purpose-groups** (`alpha`/`beta`/`qa-*`/`airbnb`/`retiredtest`/`demo`/`ghosthost`…),
-    ZERO dead/stale `hydrating` phantoms. A real user's fresh install ships with a grid of itself
-    and nothing else. Belt-and-suspenders at the product layer: the **queue-server EXPIRES stale
-    clients** (a client whose last heartbeat is older than a TTL, e.g. ~3–5 heartbeat intervals,
-    drops off `/clients`) so nothing dead lingers. ANY seeded fixture or stale phantom on the fresh
-    grid = FAIL.
+26. **REMOVED (CEO 2026-06-18) — no machines grid means no grid-cleanliness gate.** With §7.1/J11
+    gone, the generated HUD shows no machines grid, so there is no grid to pollute with test
+    fixtures. (The queue-server may still expire stale `/clients` entries as good hygiene, but it is
+    not gated here.) `/clients` is not asserted to be "clean" because it isn't rendered in the
+    product HUD anymore.
 27. **Attach links resolve to a REAL host — never a placeholder (CEO 2026-06-17).** Every
     `attach_base` advertised in `/clients`/`/agents` and every ATTACH link the HUD renders MUST
     contain the node's **real reachable host** (its `100.x` tailnet IP per §5.2) — **never a literal
@@ -618,16 +905,110 @@ kill ephemeral test workers.
     `~/.tmux/plugins/**tmux**` (the repo basename, NOT `~/.tmux/plugins/dracula`) — folded 2026-06-17,
     so check the status bar behavior, not a fixed dir name. If the live server runs defaults
     while the file is correct = the "server started before the conf / TPM never installed" regression
-    ⇒ FAIL.
+    ⇒ FAIL. **This gate is READ-ONLY (folded 2026-06-18): use only `tmux show-options`/`list-keys`;
+    NEVER `tmux kill-server` or kill sessions to reload — that destroys detached flows incl. an
+    in-progress `claude auth login` (§A.1). Apply config via `source-file` only.**
 29. **Clean minimalist — NO animations/effects (CEO 2026-06-17).** The generated `dashboard.html` +
     `todos.html` contain **zero `animation:` / `@keyframes`** (no zoom/pulse on the `hydrating` state
-    label or the live-dot, no fade-in on tasks). Assert the served/disk pages match the §A pins AND
-    contain no `@keyframes`/`animation:` declarations. Any animation on a state label = FAIL.
+    label or the live-dot, no fade-in on tasks). Assert the served pages contain no
+    `@keyframes`/`animation:` declarations. Any animation on a state label = FAIL.
+30. **NO secret in the browser (security — §5.12, CEO 2026-06-18).** Fetch the served `:9933/`,
+    `:9933/todos`, and `:9900/dashboard` bytes and assert **the live `QUEUE_SECRET` value does NOT
+    appear** anywhere in them, and there is **no secret-bearing token** (`__INJECT_SECRET__`, a
+    `const SECRET="<nonempty>"`, an `X-Queue-Secret` header hard-set to the real value, or the secret
+    in any attach/recording URL). Then prove auth still works WITHOUT a client secret: a fresh
+    browser session (cookie jar, no `X-Queue-Secret`) loads the page and its same-origin calls to a
+    gated endpoint (e.g. `/todo/board`) succeed via the httpOnly cookie; the SAME gated endpoint
+    called cross-origin/cookieless WITHOUT the header is **rejected**. Secret in client bytes = FAIL.
+    **HEADER-LEVEL Set-Cookie check (folded 2026-06-18 — catches the transient-401 gap WITHOUT a
+    browser): `curl -sI http://127.0.0.1:9933/` AND `…/dashboard` MUST each return a `Set-Cookie:`
+    header (httpOnly session) on the PAGE GET itself.** No `Set-Cookie` on the page GET = FAIL (the
+    page would 401 its first board fetch → browser-QA J31/J33/J34 break). This makes the §5.12
+    page-Set-Cookie requirement enforceable even when the puppeteer gates can't run.
+31. **Browser-QA pass (real page, real interactions — CEO 2026-06-18).** Load `:9933/` and
+    `:9900/dashboard` in a real browser (headless ok): **zero console errors / failed requests**, the
+    board renders, **add-task works from the UI** (type + Enter → the task appears), the card modal
+    opens, a comment posts, and the HUD renders (**agents + retired tables; NO hydration grid** — §7.1
+    removed). A page that 403/401s its own API, throws in console, has a dead control, or can't add a
+    task = FAIL. **Two first-try traps it MUST clear with ZERO live patches (folded 2026-06-18):**
+    (a) **`GET /favicon.ico` returns 204/200, never 404** (§5.13 — the browser auto-requests it; a 404
+    is a console error); (b) **no transient cookie-401** — the page GET sets the session cookie
+    (§5.12) so the first `/todo/board` fetch already carries it (no 401 in console). A blind generate
+    that omits the favicon route or the page Set-Cookie trips this gate first-try.
+    🔴 **(c) Modal close ALWAYS works with a normal click (CEO 2026-06-18, §7).** Open a card modal,
+    then click the **✕** — assert the modal actually closes with a **plain click** (no force-click):
+    after close, BOTH the panel and backdrop are hidden (no `#modal{display:block}` +
+    `#modalbg{display:none}` desync), and re-opening + closing via **Escape** and **backdrop click**
+    also work. A modal that needs a force-click or leaves a stuck hidden-DOM state = FAIL.
+    🔴 **(d) ATTACH lands on the ROW's OWN window AND STAYS CONNECTED (CEO 2026-06-18, §5.7).** Click
+    the **Boss** row's ATTACH while an engineer window is the session's active window → the opened
+    ttyd pane shows the **Boss** pane (not the engineer's), and clicking an engineer row shows THAT
+    engineer — each row isolated (grouped-session per viewer). The grouped view-session MUST persist:
+    the pane shows live Boss content and does **NOT** show `can't find session: _v_…` or ttyd's
+    "Press Enter to Reconnect" (the detached-session-reaped-by-destroy-unattached regression). An
+    attach that lands on the active window, or whose session vanishes on connect = FAIL.
+32. **FULL E2E comms loop — the joke protocol (CEO 2026-06-18).** First-time, no hand-holding: (a)
+    create a real task "tell me jokes, one per turn"; (b) the node's **Boss receives the ping** and
+    **spawns an engineer**; (c) the engineer posts **joke #1 as a `/todo/comment`** (its agent_id) and
+    **waits** — does NOT dump 3 at once; (d) the **comment-ping reaches the Boss** for the engineer's
+    post (proving comment→ping, §6); (e) **a CEO follow-up comment** ("another") **pings the Boss**
+    (NOT exempt — only the Boss's own comments are), which drives **round 2** (joke #2), then round 3.
+    *Assert:* the Boss pane receives BOTH a `[todo] task…` and a `[todo] comment…` line; ≥2 distinct
+    engineer joke-comments land on the board across rounds, one per round (not batched). Any link
+    broken (comment doesn't ping, engineer batches, Boss doesn't spawn) = FAIL.
+33. **Hot reload — no manual refresh (§7.2, CEO 2026-06-18).** With `:9933/` (and an open card) already
+    loaded in a browser, POST a new `/todo/comment` (and a new task) out-of-band; **within ~5s the new
+    comment appears in the open thread and the new task on the board WITHOUT a reload**; likewise the
+    HUD reflects a new `/agents`/`/roster` change live. A page that needs F5 to show the new comment =
+    FAIL.
+34. **Live-reload preserves FOCUS + CARET (§7.2, CEO 2026-06-18).** In a real browser, **focus the
+    add-task input and type slowly across ≥2 poll cycles** (e.g. type a char, wait ~1.2s for a poll,
+    type more): assert **focus stays on the input and the caret/selection is NOT reset** — the typed
+    text accumulates intact, no characters lost, cursor not yanked to start/elsewhere. Repeat for an
+    inline-edit field + the comment composer. A poll that steals focus or resets the caret = FAIL.
+    (F25)
+35. **The PRODUCT handles folder-trust on a VANILLA machine — no substrate/image assist (§5.5c, CEO
+    2026-06-18).** This gate MUST prove the product stands alone, so it tests on a **CLEAN trust
+    state**: first **strip any pre-seeded trust** — `python3 -c 'import json,os;p=os.path.expanduser
+    ("~/.claude.json");d=json.load(open(p));d["projects"]={};json.dump(d,open(p,"w"))'` (wipe the
+    `projects` trust map so NOTHING is pre-trusted, simulating a real user's fresh box). THEN confirm
+    the product's OWN logic re-establishes trust: (a) re-running the install's trust step (or the
+    generated `mp spawn`) restores `projects[<boss cwd>].hasTrustDialogAccepted=true`; (b) `mp spawn`
+    an agent in a **fresh `mkdir`'d cwd** → it reaches the bypass banner **WITHOUT** any "trust this
+    folder?"/onboarding prompt and WITHOUT blocking; agent ends `alive`. **The golden-image bake (or
+    any externally-seeded trust) MUST NOT be what makes this pass** — that's why we wipe first. A
+    spawn that hangs on a trust dialog after the wipe = the product doesn't self-handle trust = FAIL.
+36. **Nested spawn does NOT disconnect (engineer-from-engineer, §4 mp-spawn, CEO 2026-06-18).** The
+    CEO bug: an engineer born from a TODO comment runs `mp spawn` to create ANOTHER engineer and the
+    ttyd/tmux session DROPS. This gate proves a nested spawn leaves everything intact. (a) Record the
+    parent session id + window list + attached client: `tmux list-windows -t mc-main -F '#{window_name}'`
+    and `tmux list-clients -t mc-main`. (b) Open an attached ttyd client to some window
+    (`mc-main:Boss`) and confirm it renders. (c) From INSIDE an engineer's pane (e.g. `mp send
+    <eng> "mp spawn mpgen…/main:eng-child --cwd …"`, i.e. spawn invoked from within tmux), create a
+    child engineer. (d) Assert: `tmux has-session -t mc-main` STILL true; the pre-existing windows
+    are ALL still listed (none killed); the attached client from (a) is STILL attached (`list-clients`
+    shows no drop, ttyd attach URL still 200 + live pane); and the new child window
+    `mc-main:eng-child` now ALSO exists + is `alive` in `/agents`. If the parent session was killed,
+    a window vanished, or the client was switched/dropped = FAIL (the spawn clobbered the session).
+37. **PINNING — WhatsApp-starred tasks (§7.3, CEO 2026-06-20).** Drive it end-to-end via the API and
+    assert the board reflects it: (a) **Pin floats to top:** add ≥2 tasks, `update{op:'pin',id}` one
+    → `/todo/board` (or the rendered page) shows it ABOVE the normal tasks. (b) **Pin order =
+    insertion order:** pin five tasks T1..T5 in sequence → the pinned group is ordered T1,T2,T3,T4,T5
+    by ascending `pinRank` (the order they were pinned), above all normal tasks. (c) **Max 5
+    enforced:** with 5 pinned, `update{op:'pin'}` a 6th returns **`{ok:false, error:"pin_limit"}`**
+    and the 6th is NOT pinned (still in its normal position). (d) **Unpin restores:** `unpin` one →
+    its `pinned=false`/`pinRank=null`, it drops back to its normal `order` position, and the
+    remaining pins keep their order; a 6th pin now succeeds. (e) **Persists:** the `pinned`+`pinRank`
+    survive a board re-fetch AND a `todo-server` restart (they're in `board.v2.json`) — re-read
+    `/todo/board` after a restart and the pinned set + order are unchanged. (f) **UI affordance:** the
+    rendered page has a per-card ★ control and a distinct pinned group at top. Any of: pin not on top,
+    wrong pin order, a 6th pin accepted, unpin not restoring, or pins lost on reload/restart = FAIL.
 
-> Gates J14–J29 are NON-OPTIONAL (CEO 2026-06-17): the Verify harness MUST assert every one. A
+> Gates J14–J37 are NON-OPTIONAL (CEO 2026-06): the Verify harness MUST assert every one. A
 > green run with any F-feature unexercised — OR that leaves ANY test fixture / placeholder host on
-> the live grid, runs default tmux, or shows ANY animation — is a FALSE GREEN, and the harness
-> itself fails the check.
+> the live grid, runs default tmux, shows ANY animation, leaks the secret to the browser, fails the
+> joke-protocol E2E loop, needs a manual refresh, steals focus/caret on poll, **or hangs on a
+> folder-trust/onboarding dialog in any cwd** — is a FALSE GREEN, and the harness fails.
 
 ---
 
@@ -669,10 +1050,12 @@ behavioral feature contracts (§A.2). The **≤10% code budget = tokens/consts o
 components.** Pixel-exactness to any prior app is NOT required; faithful PLOW look + every gated
 behavior IS (verified behaviorally, §A.2 + §15 — there is no byte-identity gate).
 
-**Secret-injection guidance:** the page must authenticate its gated API calls with the live
-`QUEUE_SECRET`. Simplest: the generated server serves the page with an `__INJECT_SECRET__` token
-replaced by the live secret at serve-time. (Implementation is yours; the contract is only that the
-served page can call the gated endpoints.)
+**Browser auth — SERVER-SIDE ONLY, never embed the secret (§5.12).** The page makes **same-origin**
+calls and contains **NO secret**. Serving the page mints a browser session — set an **httpOnly**
+cookie (a random session token, NOT the QUEUE_SECRET) that the browser auto-sends on same-origin
+fetches; the server accepts that cookie OR an `X-Queue-Secret` header (machines) on gated endpoints.
+The QUEUE_SECRET lives only on the server. **Do NOT inject the secret into the HTML/JS** (the old
+`__INJECT_SECRET__` approach was a security bug — secret visible to anyone who loads the page).
 
 **§A.1 `~/.tmux.conf` — GENERATE it to apply the CEO's style (his settings are the consts below;
 this is NOT a pasted file and there is NO checksum — J28 gates the RUNNING server, not bytes).**
@@ -698,6 +1081,15 @@ installed. So: (1) `git clone tpm` + `~/.tmux/plugins/tpm/bin/install_plugins` (
 `tmux source-file ~/.tmux.conf` on any running server (or place the conf before any server starts);
 (3) every `mc-*` Boss/agent session must run in a server that loaded it. **J28 verifies the LIVE
 server, not the file.**
+> **NEVER `tmux kill-server` (and never kill sessions you didn't create) to apply/verify the conf
+> — folded 2026-06-18 (CEO).** `kill-server` destroys EVERY session on that server, including
+> **detached flows like an in-progress `claude auth login`** (a pending device login lives in its own
+> tmux session) — killing it aborts the login and forces a fresh URL. Apply the config with
+> **`tmux source-file ~/.tmux.conf` ONLY** (it applies global options + key-binds to the already-
+> running server WITHOUT touching sessions), or write the conf before the FIRST server starts. **J28
+> verification is READ-ONLY** — `tmux show-options -g` / `tmux list-keys` only; it must never restart
+> or kill the server. (Root cause of the J28-killed-the-login bug: a kill-server/restart to "reload"
+> the conf wiped the detached `auth` login session mid-flight.)
 
 **§A.2 UI feature contracts — GENERATED `todos.html` + `dashboard.html`, every feature MANDATORY +
 behaviorally gated.** You generate both pages (from §7 tokens + the layout) and the servers; each row
@@ -709,33 +1101,37 @@ that passes every gate is correct, per Decision B.)
 
 | # | Feature (the generated UI must do this) | Contract | Gate |
 |---|---|---|---|
-| F1 | add task (Enter) | `update{op:add,text}` → task in `needs_brainstorm`, prepended to `order` | J3 |
+| F1 | add task (Enter) | `update{op:add,text}` → task born **`idle`**, prepended to `order` | J3 |
 | F2 | delete task | `update{op:del,id}` removes from tasks+order | J15 |
 | F3 | edit text / done-condition / assignee inline | `update{op:set,id,text\|doneCondition\|assignee}` patches the field (REAL names, §6) | J16 |
-| F4 | state change (6-enum) | `update{op:set,id,state}` (field **`state`**) or `/todo/status`; enum `needs_brainstorm\|working\|review\|blocked\|done\|cancelled` | J17 |
+| F4 | state change | `update{op:set,id,state}` (field **`state`**) or `/todo/status`; enum `idle\|working\|review\|done` + `blocked\|cancelled` (NO `needs_brainstorm`) | J17 |
 | F5 | done checkbox / work-to-done toggle | `set{done}`/`set{workToDone}` flips `state`→`done`, renders strikethrough | J18 |
-| F6 | brainstorm block + needs_brainstorm gating | `/todo/brainstorm` stores body; `needs_brainstorm` tasks show the ⚠ needbrain banner | J19 |
-| F7 | answer the open question → promote | `/todo/answer` records answer + moves task out of `needs_brainstorm` | J20 |
+| F6 | **idle → working, NO gate** (folded 2026-06-18) | new task is `idle`; an engineer `set{state:working}` with no brainstorm/answer gate | J19 |
+| ~~F7~~ | ~~brainstorm/answer gate~~ **REMOVED (CEO 2026-06-18)** | no `/todo/brainstorm`, no `/todo/answer`, no `brainstorm` field, no needs-brainstorm banner | J20 (negative) |
 | F8 | comment thread (card modal) | `/todo/comment{task_id,by,body}` appends to `comments[]`, `by`=agent_id\|CEO | J5 |
-| F9 | unread badge | board returns per-task `unread` count; UI reads localStorage READ_KEY | J21 |
+| F9 | unread badge | **server-side rule (folded 2026-06-18 — was underspecified → first impl left `unread` null):** each task has an integer `unread` (default **0**); the server **increments it on every `/todo/comment` whose `by` is NOT the CEO/reader**, and `/todo/board` returns it. UI reads localStorage READ_KEY for the read-state. | J21 |
 | F10 | proofs (image/video/link/text + more) | `/todo/proof{task_id,kind,url\|body}` appends to `proofs[]`; board returns them | J22 |
 | F11 | assignee chip → attach to that engineer's terminal | `/todo/attach?agent=` resolves `{target,base}` (live) | J7 |
 | F12 | ITEM 3 — clickable commenter agent name → terminal | same resolver; non-agent (`CEO`) authors are plain text | J7 |
 | ~~F13~~ | ~~dependencies/subtasks/hard-gate~~ **REMOVED (CEO 2026-06-17)** | backend must NOT implement `add{parent}`/`dependsOn`/`hardGate`; generated UI has no such controls | J23 (negative) |
-| F14 | board→Boss ping on non-test add | `mp send <BOSS_AGENT>` logged to `boss-inbox.log` (§6); test tasks exempt | J3 |
+| F14 | board→Boss ping on **add AND every comment** | `mp send <BOSS_AGENT>` on non-test add + on each `/todo/comment` (exempt only the Boss's own); logged to `boss-inbox.log` (§6) | J3 + J32 |
 | F15 | ITEM 2 — cross-nav HUD ↗ | static link to `:9900/dashboard` (built from `location.hostname`) | J6 |
 | F16 | verified badge | board returns `verified`; UI shows the "verified" badge | J24 |
+| F23 | LIVE hot-reload (no manual refresh) | page polls ≤~3s (or SSE); new tasks/comments/state appear without F5 (§7.2) | J33 |
+| F24 | full E2E comms loop (joke protocol) | task→Boss→spawn engineer→engineer comments one-per-turn→CEO comment pings Boss→next round (§8) | J32 |
+| F25 | poll preserves FOCUS + caret (folded 2026-06-18) | the incremental update never re-renders/replaces the focused input nor resets caret/selection; typing in the add box is uninterrupted by the 1s poll (§7.2) | J34 |
 
 **HUD backend (`queue-server.py`, `/dashboard`) — every gate:**
 
 | # | Feature | Backend contract | Gate |
 |---|---|---|---|
-| F17 | machines grid grouped by `purpose` + per-group COUNT | `/clients` carries `purpose`; ≥1 group header `"<purpose> hydration · N"` | J11 |
-| F18 | per-node state `hydrating\|ready\|failed` + alive/dead | `/clients` carries `state` + `last_seen` (§5.11) | J11 |
-| F19 | per-node type / machine / attach / recording | `/clients` carries `node_type`,`hostname`,`attach_base`,`recording_url` | J11 |
+| ~~F17~~ | ~~machines grid grouped by purpose + count~~ **REMOVED (CEO 2026-06-18)** | the generated HUD has NO machines/hydration grid (§7.1 removed); J11 dropped | — |
+| ~~F18~~ | ~~per-node state/alive in grid~~ **REMOVED** | (the `/clients` `state`/`last_seen` fields still exist for the OUTER uplink, just not rendered in the product HUD) | — |
+| ~~F19~~ | ~~per-node type/machine/attach/recording card~~ **REMOVED** | — | — |
 | F20 | agents table (id/state/backend/boss/summary/attach) | `/agents` carries those fields + `tmux_target` | J8 |
 | F21 | retired engineers + Revive button | `/roster` carries `retired`; `POST /revive{agent_id}` works | J25 |
-| F22 | ITEM 2 — cross-nav TODO ↗ + live/stale pill + counts | static link to `:9933`; counts from `/clients`+`/agents` | J6 |
+| F22 | ITEM 2 — cross-nav TODO ↗ + live/stale pill + agent count | static link to `:9933`; count from `/agents` | J6 |
+| F23 | PIN tasks (WhatsApp-starred, §7.3) — ★ pin/unpin, pinned float to top in pin order, MAX 5, unpin restores, persists | `update{op:'pin'\|'unpin',id}`; `pinned`+`pinRank` in `board.v2.json`; board renders pinned-first by `pinRank` | J37 |
 
 **§A.3 How the UI is verified now (Decision B — behavioral, NOT checksum).** There is **no
 byte-identity / sha256 gate**. The generated UI is correct when: it carries the PLOW tokens (J9 —
